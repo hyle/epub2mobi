@@ -8,6 +8,7 @@ from __future__ import annotations
 import html as htmlmod
 import logging
 import os
+import re
 import shutil
 import struct
 import sys
@@ -136,6 +137,10 @@ class EpubParser:
             def strip_ns(tag: str) -> str:
                 return tag.split("}", 1)[1] if "}" in tag else tag
 
+            unique_id = opf_root.attrib.get("unique-identifier")
+            fallback_uuid = None
+            chosen_uuid = None
+
             for elem in opf_root.iter():
                 t = strip_ns(elem.tag)
                 if t == "title" and elem.text:
@@ -143,7 +148,16 @@ class EpubParser:
                 elif t == "creator" and elem.text:
                     self.author = elem.text.strip() or self.author
                 elif t == "identifier" and elem.text:
-                    self.uuid = elem.text.strip() or self.uuid
+                    ident = elem.text.strip()
+                    if ident and not fallback_uuid:
+                        fallback_uuid = ident
+                    if unique_id and elem.attrib.get("id") == unique_id and ident:
+                        chosen_uuid = ident
+
+            if chosen_uuid:
+                self.uuid = chosen_uuid
+            elif fallback_uuid:
+                self.uuid = fallback_uuid
 
             manifest_node = None
             spine_node = None
@@ -180,7 +194,7 @@ class EpubParser:
                 full = os.path.join(base_dir, rel).replace("\\", "/")
                 try:
                     # Read as UTF-8 from source, sanitize, then we encode to cp1252 later
-                    raw = z.read(full).decode("utf-8", errors="replace")
+                    raw = self._decode_xhtml(z.read(full))
                 except KeyError:
                     logger.warning(f"Missing file in EPUB: {full}")
                     continue
@@ -210,6 +224,16 @@ class EpubParser:
                 if name.endswith(".opf"):
                     return name, os.path.dirname(name)
             raise ValueError("No OPF file found")
+
+    @staticmethod
+    def _decode_xhtml(data: bytes) -> str:
+        head = data[:1024].decode("ascii", errors="ignore")
+        match = re.search(r'encoding=["\']([A-Za-z0-9._-]+)["\']', head)
+        encoding = match.group(1) if match else "utf-8"
+        try:
+            return data.decode(encoding, errors="replace")
+        except LookupError:
+            return data.decode("utf-8", errors="replace")
 
 
 class MinimalHtmlSanitizer(HTMLParser):
