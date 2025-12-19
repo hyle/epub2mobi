@@ -240,12 +240,33 @@ class MinimalHtmlSanitizer(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         # Block elements that imply a new line
-        self.blocks = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "li", "br"}
+        self.blocks = {
+            "p",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "blockquote",
+            "pre",
+            "ul",
+            "ol",
+            "li",
+            "br",
+        }
         # Inline elements to keep
         self.inline = {"b", "i", "strong", "em", "code", "span", "a", "mbp:pagebreak"}
 
         self.allowed = self.blocks | self.inline
         self.fed: list[str] = []
+
+    def _ensure_block_sep(self) -> None:
+        if self.fed:
+            last = self.fed[-1]
+            if last and last[-1] != "\n":
+                self.fed.append("\n")
 
     def sanitize(self, html_str: str) -> str:
         self.fed = []
@@ -256,6 +277,10 @@ class MinimalHtmlSanitizer(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         if tag in self.allowed:
+            if tag in ("br", "mbp:pagebreak"):
+                self.fed.append(f"<{tag}/>")
+                return
+
             # Reconstruct the tag
             attr_str = ""
             # Only keep 'href' for anchors, ignore classes/styles as legacy MOBI ignores them mostly
@@ -269,6 +294,8 @@ class MinimalHtmlSanitizer(HTMLParser):
             if tag == "strong": tag = "b"
             if tag == "em": tag = "i"
 
+            if tag in self.blocks:
+                self._ensure_block_sep()
             self.fed.append(f"<{tag}{attr_str}>")
 
     def handle_endtag(self, tag):
