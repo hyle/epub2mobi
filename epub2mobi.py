@@ -502,7 +502,7 @@ class MobiWriter:
         text_bytes = _encode_mobi_text(html_str)
         text_records = self._safe_chunk_bytes(text_bytes, TEXT_RECORD_MAX)
 
-        include_dummy = True
+        include_dummy = False
         record0, _, _ = self._build_record0(
             text_len=len(text_bytes),
             text_rec_count=len(text_records),
@@ -511,9 +511,6 @@ class MobiWriter:
 
         records: list[bytes] = [record0]
         records.extend(text_records)
-        if include_dummy:
-            records.append(b"\x00\x00") # Dummy Record
-
         records.extend([self._build_flis(), self._build_fcis(len(text_bytes)), self._build_eof()])
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)
