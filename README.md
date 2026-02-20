@@ -1,45 +1,54 @@
 # epub2mobi.py
 
-A lightweight, zero-dependency Python script to convert EPUB files into the legacy MOBI (MOBI6) format.
+`epub2mobi.py` is a zero-dependency Python tool that converts EPUB files to legacy MOBI6 for older Kindle devices.
 
-This tool is designed for **simplicity** and **longevity**. It does not rely on `kindlegen`, `calibre`, or heavy external libraries. It writes the binary headers manually using the Python standard library, making it ideal for archival purposes or supporting also older Kindle devices.
+It writes PalmDB/MOBI structures directly with the standard library and focuses on robust, text-first output.
 
 ## Features
 
-* **Zero Dependencies:** Runs on any machine with Python 3.7+. No `pip install` required.
-* **Legacy Support:** Forces `CP1252` encoding and simplified HTML to ensure maximum compatibility with old E-Ink devices.
-* **Auto-Deploy:** Automatically detects a connected Kindle via USB and copies the file to the `documents` folder.
-* **Smart Sanitization:** Strips complex CSS/JS but preserves structure (chapters, paragraphs, bold/italic, lists) for a distraction-free reading experience.
+- Zero dependencies (`python3` only).
+- EPUB parsing via OPF manifest/spine with path normalization for ZIP internals.
+- Table of Contents generation with fixed-width `filepos` links.
+- TOC labels prioritized from NCX nav labels, then headings/titles, then body snippets/fallbacks.
+- PalmDOC compression (type `2`), applied per 4096-byte uncompressed text record.
+- Legacy-compatible content sanitization (text/paragraphs/basic inline tags).
+- Optional USB deploy to Kindle `documents` folder (`--deploy`).
 
-## Usage
+## Requirements
 
-1. **Download** the script:
-```bash
-wget https://raw.githubusercontent.com/hyle/epub2mobi/main/epub2mobi.py
+- Python 3.10+
 
-```
+## CLI Usage
 
+Convert:
 
-2. **Run** the conversion:
 ```bash
 python3 epub2mobi.py my_book.epub
-
 ```
 
+Convert and deploy to a connected Kindle:
 
-*Creates `my_book.mobi` in the same directory.*
-3. **Convert & Copy to Kindle:**
 ```bash
 python3 epub2mobi.py my_book.epub --deploy
-
 ```
 
+## Module Usage
 
-## Limitations
+```python
+from epub2mobi import parse_epub, MobiWriter
 
-* **Text & Structure Only:** Images are intentionally stripped to keep the file size low and the code simple.
-* **MOBI6 Format:** This generates the older "MobiPocket" format, not the newer AZW3/KF8 format. It does not support embedded fonts or advanced CSS.
+epub_data = parse_epub("my_book.epub")
+MobiWriter(epub_data).build("my_book.mobi")
+```
+
+## Scope and Limitations
+
+- Output target is MOBI6 (not AZW3/KF8).
+- Text-first conversion: advanced CSS, JavaScript, embedded fonts, and rich modern layout are not preserved.
+- Images are currently not emitted into MOBI records.
+- XHTML decoding supports BOMs and declared encodings, with fallback behavior for unknown encodings.
+- XML guardrails reject entity declarations and oversized XML payloads.
 
 ## License
 
-MIT License. Feel free to modify and publish.
+MIT License.
