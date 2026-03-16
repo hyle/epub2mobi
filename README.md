@@ -10,8 +10,9 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 - EPUB parsing via OPF manifest/spine with path normalization for ZIP internals.
 - Table of Contents generation with fixed-width `filepos` links.
 - TOC labels prioritized from NCX nav labels, then headings/titles, then body snippets/fallbacks.
+- Internal EPUB links and fragment targets are rewritten to work in the flattened MOBI output.
 - PalmDOC compression (type `2`), applied per 4096-byte uncompressed text record.
-- Legacy-compatible content sanitization (text/paragraphs/basic inline tags).
+- Legacy-compatible body sanitization (text/paragraphs/basic inline tags, with head/script/style content removed).
 - Optional USB deploy to Kindle `documents` folder (`--deploy`).
 
 ## Requirements
