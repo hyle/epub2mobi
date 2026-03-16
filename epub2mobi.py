@@ -13,6 +13,7 @@ import re
 import shutil
 import struct
 import sys
+import urllib.parse
 import zipfile
 import zlib
 # Note: Standard ET is not secure against maliciously constructed XML data
@@ -125,6 +126,17 @@ class EpubData:
     toc_entries: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class SpineItem:
+    index: int
+    href: str
+    full_path: str
+    anchor: str
+    stem: str
+    raw_html: str
+    body_html: str
+
+
 def _palm_time_now() -> int:
     return int((datetime.now() - datetime(1904, 1, 1)).total_seconds())
 
@@ -193,18 +205,7 @@ def _extract_title(html_str: str) -> str | None:
 
 
 def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -> str | None:
-    lower = html_str.lower()
-    body_open = lower.find("<body")
-    if body_open != -1:
-        body_tag_end = html_str.find(">", body_open)
-        start = body_tag_end + 1 if body_tag_end != -1 else body_open
-        candidate = html_str[start:]
-    else:
-        head_close = lower.find("</head>")
-        if head_close != -1:
-            candidate = html_str[head_close + len("</head>") :]
-        else:
-            candidate = html_str[min(4096, len(html_str)) :]
+    candidate = _extract_body_html(html_str)
 
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", candidate)
     text = re.sub(r"(?is)<[^>]+>", " ", text)
@@ -230,6 +231,51 @@ def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -
 
 def _normalize_epub_path(path: str) -> str:
     return posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+
+
+def _extract_body_html(html_str: str) -> str:
+    lower = html_str.lower()
+    body_open = lower.find("<body")
+    if body_open != -1:
+        body_tag_end = html_str.find(">", body_open)
+        start = body_tag_end + 1 if body_tag_end != -1 else body_open
+        body_close = lower.rfind("</body>")
+        if body_close != -1 and body_close > start:
+            return html_str[start:body_close]
+        return html_str[start:]
+
+    head_close = lower.find("</head>")
+    if head_close != -1:
+        return html_str[head_close + len("</head>") :]
+    return html_str
+
+
+def _resolve_book_href(current_path: str, href: str) -> tuple[str, str | None] | None:
+    parsed = urllib.parse.urlsplit(href)
+    if parsed.scheme or parsed.netloc:
+        return None
+
+    target_path = current_path
+    if parsed.path:
+        target_path = _normalize_epub_path(
+            posixpath.join(posixpath.dirname(current_path), urllib.parse.unquote(parsed.path))
+        )
+
+    fragment = urllib.parse.unquote(parsed.fragment) if parsed.fragment else None
+    return target_path, fragment
+
+
+class FragmentIdCollector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.fragments: list[str] = []
+        self._seen: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        for key, value in attrs:
+            if key in {"id", "name"} and value and value not in self._seen:
+                self.fragments.append(value)
+                self._seen.add(value)
 
 
 def _build_ncx_label_map(
@@ -383,9 +429,7 @@ def parse_epub(filepath: str | Path) -> EpubData:
             base_dir=base_dir,
         )
 
-        sanitizer = MinimalHtmlSanitizer()
-        parts: list[str] = []
-        raw_toc: list[tuple[str, str, str, int]] = []
+        spine_items: list[SpineItem] = []
         for spine_idx, item_id in enumerate(spine_refs, start=1):
             rel = manifest.get(item_id)
             if not rel:
@@ -396,23 +440,51 @@ def parse_epub(filepath: str | Path) -> EpubData:
             except KeyError:
                 logger.warning("Missing file in EPUB: %s", full)
                 continue
-            anchor = f"spine_{spine_idx}"
-            stem = Path(rel).stem
-            ncx_title = ncx_labels.get(full)
-            guessed_title = _extract_title(raw)
+            body_html = _extract_body_html(raw)
+            spine_items.append(
+                SpineItem(
+                    index=spine_idx,
+                    href=rel,
+                    full_path=full,
+                    anchor=f"spine_{spine_idx}",
+                    stem=Path(rel).stem,
+                    raw_html=raw,
+                    body_html=body_html,
+                )
+            )
+
+        file_anchor_map = {item.full_path: item.anchor for item in spine_items}
+        fragment_anchor_map: dict[tuple[str, str], str] = {}
+        for item in spine_items:
+            collector = FragmentIdCollector()
+            collector.feed(item.body_html)
+            collector.close()
+            for fragment_idx, fragment in enumerate(collector.fragments, start=1):
+                fragment_anchor_map[(item.full_path, fragment)] = f"{item.anchor}_frag_{fragment_idx}"
+
+        parts: list[str] = []
+        raw_toc: list[tuple[str, str, str, int]] = []
+        for item in spine_items:
+            ncx_title = ncx_labels.get(item.full_path)
+            guessed_title = _extract_title(item.raw_html)
             chapter_title = ncx_title or guessed_title
             if (
                 not chapter_title
                 or chapter_title.strip().lower() in ("unknown", "untitled")
                 or chapter_title.strip().lower() == book_title.strip().lower()
             ):
-                body_snippet = _extract_body_snippet(raw, book_title)
-                chapter_title = body_snippet or chapter_title or stem or anchor
+                body_snippet = _extract_body_snippet(item.raw_html, book_title)
+                chapter_title = body_snippet or chapter_title or item.stem or item.anchor
 
-            clean = sanitizer.sanitize(raw)
+            sanitizer = MinimalHtmlSanitizer(
+                current_path=item.full_path,
+                file_anchor_map=file_anchor_map,
+                fragment_anchor_map=fragment_anchor_map,
+            )
+            clean = sanitizer.sanitize(item.body_html)
             if clean:
-                raw_toc.append((anchor, chapter_title, stem, spine_idx))
-                parts.append(f'<a name="{anchor}" id="{anchor}"></a>')
+                raw_toc.append((item.anchor, chapter_title, item.stem, item.index))
+                parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
                 parts.append(clean)
                 parts.append("<mbp:pagebreak/>")
 
@@ -434,7 +506,7 @@ def parse_epub(filepath: str | Path) -> EpubData:
             toc_entries.append((anchor, resolved))
 
         html_content = "".join(parts)
-        logger.info("Parsed %d spine items. Title: %s", len(spine_refs), book_title)
+        logger.info("Parsed %d spine items. Title: %s", len(spine_items), book_title)
         return EpubData(
             title=book_title,
             author=book_author,
@@ -468,9 +540,20 @@ class MinimalHtmlSanitizer(HTMLParser):
     )
     _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
 
-    def __init__(self):
+    _SUPPRESSED: frozenset[str] = frozenset({"script", "style"})
+
+    def __init__(
+        self,
+        current_path: str,
+        file_anchor_map: dict[str, str],
+        fragment_anchor_map: dict[tuple[str, str], str],
+    ):
         super().__init__(convert_charrefs=True)
+        self.current_path = current_path
+        self.file_anchor_map = file_anchor_map
+        self.fragment_anchor_map = fragment_anchor_map
         self.fed: list[str] = []
+        self._suppressed_depth = 0
 
     def _ensure_block_sep(self) -> None:
         if self.fed:
@@ -478,14 +561,46 @@ class MinimalHtmlSanitizer(HTMLParser):
             if last and last[-1] != "\n":
                 self.fed.append("\n")
 
+    def _inject_named_anchors(self, attrs) -> None:
+        seen: set[str] = set()
+        for key, value in attrs:
+            if key not in {"id", "name"} or not value or value in seen:
+                continue
+            seen.add(value)
+            target = self.fragment_anchor_map.get((self.current_path, value))
+            if target:
+                self.fed.append(f'<a name="{target}" id="{target}"></a>')
+
+    def _rewrite_href(self, href: str) -> str | None:
+        resolved = _resolve_book_href(self.current_path, href)
+        if resolved is None:
+            return href
+
+        target_path, fragment = resolved
+        if fragment:
+            exact = self.fragment_anchor_map.get((target_path, fragment))
+            if exact:
+                return f"#{exact}"
+
+        fallback = self.file_anchor_map.get(target_path)
+        if fallback:
+            return f"#{fallback}"
+        return None
+
     def sanitize(self, html_str: str) -> str:
         self.fed = []
+        self._suppressed_depth = 0
         self.reset()
         self.feed(html_str)
         self.close()
         return "".join(self.fed)
 
     def handle_starttag(self, tag, attrs):
+        if tag in self._SUPPRESSED:
+            self._suppressed_depth += 1
+            return
+
+        self._inject_named_anchors(attrs)
         if tag in self._ALLOWED:
             if tag in ("br", "mbp:pagebreak"):
                 self.fed.append(f"<{tag}/>")
@@ -497,7 +612,9 @@ class MinimalHtmlSanitizer(HTMLParser):
             if tag == "a":
                 for k, v in attrs:
                     if k == "href":
-                        attr_str = f' href="{htmlmod.escape(v, quote=True)}"'
+                        rewritten = self._rewrite_href(v)
+                        if rewritten:
+                            attr_str = f' href="{htmlmod.escape(rewritten, quote=True)}"'
                         break
 
             # Map modern semantics to legacy
@@ -509,6 +626,10 @@ class MinimalHtmlSanitizer(HTMLParser):
             self.fed.append(f"<{tag}{attr_str}>")
 
     def handle_endtag(self, tag):
+        if tag in self._SUPPRESSED:
+            self._suppressed_depth = max(0, self._suppressed_depth - 1)
+            return
+
         # Map modern semantics to legacy
         if tag == "strong": tag = "b"
         if tag == "em": tag = "i"
@@ -521,6 +642,10 @@ class MinimalHtmlSanitizer(HTMLParser):
                 self.fed.append("\n")
 
     def handle_startendtag(self, tag, attrs):
+        if tag in self._SUPPRESSED:
+            return
+
+        self._inject_named_anchors(attrs)
         if tag in self._ALLOWED:
             if tag == "br":
                 self.fed.append("<br/>")
@@ -528,6 +653,8 @@ class MinimalHtmlSanitizer(HTMLParser):
                 self.fed.append("<mbp:pagebreak/>")
 
     def handle_data(self, data):
+        if self._suppressed_depth:
+            return
         # Escape content to ensure XML validity
         self.fed.append(htmlmod.escape(data, quote=False))
 
