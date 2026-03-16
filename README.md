@@ -17,7 +17,7 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 
 ## CLI Usage
 
