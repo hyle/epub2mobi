@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Optional, Tuple, Union
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -191,7 +192,7 @@ def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
     return normalized_opf, posixpath.dirname(normalized_opf)
 
 
-def _extract_title(html_str: str) -> str | None:
+def _extract_title(html_str: str) -> Optional[str]:
     parser = SimpleTitleExtractor()
     parser.feed(html_str)
     parser.close()
@@ -204,7 +205,7 @@ def _extract_title(html_str: str) -> str | None:
     return None
 
 
-def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -> str | None:
+def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -> Optional[str]:
     candidate = _extract_body_html(html_str)
 
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", candidate)
@@ -250,7 +251,7 @@ def _extract_body_html(html_str: str) -> str:
     return html_str
 
 
-def _resolve_book_href(current_path: str, href: str) -> tuple[str, str | None] | None:
+def _resolve_book_href(current_path: str, href: str) -> Optional[Tuple[str, Optional[str]]]:
     parsed = urllib.parse.urlsplit(href)
     if parsed.scheme or parsed.netloc:
         return None
@@ -351,7 +352,7 @@ def _decode_xhtml(data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
 
 
-def parse_epub(filepath: str | Path) -> EpubData:
+def parse_epub(filepath: Union[str, Path]) -> EpubData:
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(str(filepath))
@@ -571,7 +572,7 @@ class MinimalHtmlSanitizer(HTMLParser):
             if target:
                 self.fed.append(f'<a name="{target}" id="{target}"></a>')
 
-    def _rewrite_href(self, href: str) -> str | None:
+    def _rewrite_href(self, href: str) -> Optional[str]:
         resolved = _resolve_book_href(self.current_path, href)
         if resolved is None:
             return href
