@@ -721,6 +721,17 @@ class MobiWriter:
         parts.append("<mbp:pagebreak/>")
         return "".join(parts)
 
+    @staticmethod
+    def _build_guide_html(toc_filepos: int) -> str:
+        if toc_filepos < 0 or toc_filepos >= TOC_FILEPOS_MAX:
+            raise ValueError(f"Guide filepos out of range: {toc_filepos}")
+        safe_filepos = f"{toc_filepos:0{TOC_FILEPOS_WIDTH}d}"
+        return (
+            "<guide>"
+            f'<reference type="toc" title="Table of Contents" filepos="{safe_filepos}"/>'
+            "</guide>"
+        )
+
     def _build_toc_bytes(self, html_prefix_len: int, body_bytes: bytes) -> bytes:
         entries = self.epub.toc_entries
         if len(entries) < 2:
@@ -733,6 +744,28 @@ class MobiWriter:
         toc_len = len(provisional_toc)
         final_positions = [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
         return _encode_mobi_text(MobiWriter._build_toc_html(entries, final_positions))
+
+    def _build_text_bytes(self) -> bytes:
+        html_prefix = (
+            "<html><head>"
+            f'<meta http-equiv="Content-Type" content="text/html; charset={HTML_META_CHARSET}"/>'
+            "</head><body>"
+        )
+        html_suffix = "</body></html>"
+
+        prefix_bytes = _encode_mobi_text(html_prefix)
+        body_bytes = _encode_mobi_text(self.epub.html_content)
+        guide_bytes = b""
+        toc_prefix_len = len(prefix_bytes)
+        if len(self.epub.toc_entries) >= 2:
+            provisional_guide = _encode_mobi_text(MobiWriter._build_guide_html(0))
+            toc_filepos = len(prefix_bytes) + len(provisional_guide)
+            guide_bytes = _encode_mobi_text(MobiWriter._build_guide_html(toc_filepos))
+            toc_prefix_len += len(guide_bytes)
+
+        toc_bytes = self._build_toc_bytes(toc_prefix_len, body_bytes)
+        suffix_bytes = _encode_mobi_text(html_suffix)
+        return prefix_bytes + guide_bytes + toc_bytes + body_bytes + suffix_bytes
 
     @staticmethod
     def _best_backref(data: bytes, pos: int) -> tuple[int, int]:
@@ -996,19 +1029,7 @@ class MobiWriter:
         return bytes(pdb), bytes(rec_info)
 
     def build(self, output_file: str) -> None:
-        html_prefix = (
-            "<html><head>"
-            f'<meta http-equiv="Content-Type" content="text/html; charset={HTML_META_CHARSET}"/>'
-            "</head><body>"
-        )
-        html_suffix = "</body></html>"
-
-        # Encode text as CP1252 (with fallback)
-        prefix_bytes = _encode_mobi_text(html_prefix)
-        body_bytes = _encode_mobi_text(self.epub.html_content)
-        toc_bytes = self._build_toc_bytes(len(prefix_bytes), body_bytes)
-        suffix_bytes = _encode_mobi_text(html_suffix)
-        text_bytes = prefix_bytes + toc_bytes + body_bytes + suffix_bytes
+        text_bytes = self._build_text_bytes()
         uncompressed_records = self._safe_chunk_bytes(text_bytes, TEXT_RECORD_MAX)
         text_records = [self._compress_palmdoc(rec) for rec in uncompressed_records]
         self._validate_record_layout(
