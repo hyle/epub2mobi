@@ -111,6 +111,14 @@ OFF_TAIL_E0 = 0xD0          # 0xFFFFFFFF
 OFF_TAIL_E4 = 0xD4          # 0
 OFF_TAIL_E8 = 0xD8          # 0xFFFFFFFF
 OFF_TAIL_EC = 0xDC          # 0xFFFFFFFF
+OFF_EXTRA_RECORD_DATA_FLAGS = 0xE0
+OFF_INDX = 0xE4
+
+INDX_HEADER_LEN = 192
+INDX_TYPE_NORMAL = 0
+INDX_TYPE_INFLECTION = 2
+INDX_INVALID = 0xFFFFFFFF
+INDX_LABEL_ENCODING = 65001  # UTF-8
 
 
 def _strip_ns(tag: str) -> str:
@@ -138,6 +146,13 @@ class SpineItem:
     body_html: str
 
 
+@dataclass(frozen=True)
+class TextLayout:
+    text_bytes: bytes
+    toc_filepos: Optional[int]
+    toc_entry_positions: tuple[int, ...]
+
+
 def _palm_time_now() -> int:
     return int((datetime.now() - datetime(1904, 1, 1)).total_seconds())
 
@@ -154,6 +169,22 @@ def _encode_mobi_text(s: str) -> bytes:
 def _encode_meta(s: str) -> bytes:
     """Encode metadata same as content."""
     return s.encode(MOBI_TEXT_ENCODING_PY, errors="replace")
+
+
+def _encode_index_text(s: str) -> bytes:
+    return s.encode("utf-8")
+
+
+def _encode_vwi(value: int) -> bytes:
+    if value < 0:
+        raise ValueError(f"Negative VWI value: {value}")
+    chunks = [value & 0x7F]
+    value >>= 7
+    while value:
+        chunks.append(value & 0x7F)
+        value >>= 7
+    chunks[0] |= 0x80
+    return bytes(reversed(chunks))
 
 
 def _parse_xml(data: bytes, source_name: str) -> ET.Element:
@@ -732,20 +763,19 @@ class MobiWriter:
             "</guide>"
         )
 
-    def _build_toc_bytes(self, html_prefix_len: int, body_bytes: bytes) -> bytes:
+    def _compute_toc_positions(self, html_prefix_len: int, body_bytes: bytes) -> list[int]:
         entries = self.epub.toc_entries
         if len(entries) < 2:
-            return b""
+            return []
 
         body_anchor_positions = self._find_anchor_positions(body_bytes)
         provisional_positions = [0] * len(entries)
         # Fixed-width filepos digits keep TOC byte length stable between provisional/final passes.
         provisional_toc = _encode_mobi_text(MobiWriter._build_toc_html(entries, provisional_positions))
         toc_len = len(provisional_toc)
-        final_positions = [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
-        return _encode_mobi_text(MobiWriter._build_toc_html(entries, final_positions))
+        return [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
 
-    def _build_text_bytes(self) -> bytes:
+    def _build_text_layout(self) -> TextLayout:
         html_prefix = (
             "<html><head>"
             f'<meta http-equiv="Content-Type" content="text/html; charset={HTML_META_CHARSET}"/>'
@@ -756,16 +786,144 @@ class MobiWriter:
         prefix_bytes = _encode_mobi_text(html_prefix)
         body_bytes = _encode_mobi_text(self.epub.html_content)
         guide_bytes = b""
+        toc_bytes = b""
+        toc_filepos = None
+        toc_entry_positions: tuple[int, ...] = ()
         toc_prefix_len = len(prefix_bytes)
         if len(self.epub.toc_entries) >= 2:
             provisional_guide = _encode_mobi_text(MobiWriter._build_guide_html(0))
             toc_filepos = len(prefix_bytes) + len(provisional_guide)
             guide_bytes = _encode_mobi_text(MobiWriter._build_guide_html(toc_filepos))
             toc_prefix_len += len(guide_bytes)
+            final_positions = self._compute_toc_positions(toc_prefix_len, body_bytes)
+            toc_entry_positions = tuple(final_positions)
+            toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions))
 
-        toc_bytes = self._build_toc_bytes(toc_prefix_len, body_bytes)
         suffix_bytes = _encode_mobi_text(html_suffix)
-        return prefix_bytes + guide_bytes + toc_bytes + body_bytes + suffix_bytes
+        return TextLayout(
+            text_bytes=prefix_bytes + guide_bytes + toc_bytes + body_bytes + suffix_bytes,
+            toc_filepos=toc_filepos,
+            toc_entry_positions=toc_entry_positions,
+        )
+
+    @staticmethod
+    def _build_tagx() -> bytes:
+        tags = (
+            (1, 1, 0x01, 0),
+            (2, 1, 0x02, 0),
+            (3, 1, 0x04, 0),
+            (4, 1, 0x08, 0),
+            (0, 0, 0x00, 1),
+        )
+        tagx = bytearray()
+        tagx.extend(b"TAGX")
+        tagx.extend(struct.pack(">I", 12 + (len(tags) * 4)))
+        tagx.extend(struct.pack(">I", 1))
+        for tag, values, mask, end_flag in tags:
+            tagx.extend(bytes((tag, values, mask, end_flag)))
+        return bytes(tagx)
+
+    @staticmethod
+    def _build_indx_header(
+        *,
+        indx_type: int,
+        idxt_offset: int,
+        num_records: int,
+        encoding: int,
+        total_entries: int,
+        num_cncx: int,
+        tagx_offset: int = 0,
+        unk1: int = 0,
+    ) -> bytes:
+        header = bytearray(INDX_HEADER_LEN)
+        header[0:4] = b"INDX"
+        struct.pack_into(">I", header, 4, INDX_HEADER_LEN)
+        struct.pack_into(">I", header, 12, unk1)
+        struct.pack_into(">I", header, 16, indx_type)
+        struct.pack_into(">I", header, 20, idxt_offset)
+        struct.pack_into(">I", header, 24, num_records)
+        struct.pack_into(">I", header, 28, encoding)
+        struct.pack_into(">I", header, 32, INDX_INVALID)
+        struct.pack_into(">I", header, 36, total_entries)
+        struct.pack_into(">I", header, 52, num_cncx)
+        struct.pack_into(">I", header, 180, tagx_offset)
+        return bytes(header)
+
+    @staticmethod
+    def _build_idxt(offsets: list[int]) -> bytes:
+        table = bytearray()
+        table.extend(b"IDXT")
+        for offset in offsets:
+            if offset > 0xFFFF:
+                raise ValueError(f"IDXT offset out of range: {offset}")
+            table.extend(struct.pack(">H", offset))
+        pad = len(table) % 4
+        if pad:
+            table.extend(b"\x00" * (4 - pad))
+        return bytes(table)
+
+    def _build_navigation_records(self, layout: TextLayout) -> list[bytes]:
+        if len(self.epub.toc_entries) < 2:
+            return []
+
+        label_record = bytearray()
+        label_offsets: list[int] = []
+        for _, title in self.epub.toc_entries:
+            label_offsets.append(len(label_record))
+            label_bytes = _encode_index_text(title)
+            label_record.extend(_encode_vwi(len(label_bytes)))
+            label_record.extend(label_bytes)
+
+        if len(label_record) > 0xFFFF:
+            raise ValueError("CNCX label record exceeds single-record limit")
+
+        entry_offsets: list[int] = []
+        entries_blob = bytearray()
+        entry_positions = list(layout.toc_entry_positions)
+        text_length = len(layout.text_bytes)
+        for index, ((_, _title), filepos, label_offset) in enumerate(
+            zip(self.epub.toc_entries, entry_positions, label_offsets)
+        ):
+            entry_offsets.append(INDX_HEADER_LEN + len(entries_blob))
+            name = f"{index:03d}".encode("ascii")
+            next_filepos = entry_positions[index + 1] if index + 1 < len(entry_positions) else text_length
+            length = max(1, next_filepos - filepos)
+
+            entries_blob.append(len(name))
+            entries_blob.extend(name)
+            entries_blob.append(0x0F)
+            entries_blob.extend(_encode_vwi(filepos))
+            entries_blob.extend(_encode_vwi(length))
+            entries_blob.extend(_encode_vwi(label_offset))
+            entries_blob.extend(_encode_vwi(0))
+
+        secondary_idxt = self._build_idxt(entry_offsets)
+        secondary_header = self._build_indx_header(
+            indx_type=INDX_TYPE_NORMAL,
+            idxt_offset=INDX_HEADER_LEN + len(entries_blob),
+            num_records=len(self.epub.toc_entries),
+            encoding=INDX_INVALID,
+            total_entries=0,
+            num_cncx=0,
+            unk1=1,
+        )
+        secondary_record = secondary_header + bytes(entries_blob) + secondary_idxt
+
+        tagx = self._build_tagx()
+        main_dummy = bytes((len(b"000"),)) + b"000"
+        main_idxt = self._build_idxt([INDX_HEADER_LEN + len(tagx)])
+        main_header = self._build_indx_header(
+            indx_type=INDX_TYPE_INFLECTION,
+            idxt_offset=INDX_HEADER_LEN + len(tagx) + len(main_dummy),
+            num_records=1,
+            encoding=INDX_LABEL_ENCODING,
+            total_entries=len(self.epub.toc_entries),
+            num_cncx=1,
+            tagx_offset=INDX_HEADER_LEN,
+        )
+        main_record = main_header + tagx + main_dummy + main_idxt
+
+        return [main_record, secondary_record, bytes(label_record)]
 
     @staticmethod
     def _best_backref(data: bytes, pos: int) -> tuple[int, int]:
@@ -912,12 +1070,18 @@ class MobiWriter:
         return bytes(exth)
 
     @staticmethod
-    def _compute_record_indices(text_rec_count: int) -> tuple[int, int]:
-        flis_idx = 1 + text_rec_count
+    def _compute_record_indices(text_rec_count: int, nav_rec_count: int) -> tuple[int, int]:
+        flis_idx = 1 + text_rec_count + nav_rec_count
         return flis_idx, flis_idx + 1
 
     def _build_record0(
-        self, uncompressed_text_len: int, text_rec_count: int, flis_idx: int, fcis_idx: int
+        self,
+        uncompressed_text_len: int,
+        text_rec_count: int,
+        flis_idx: int,
+        fcis_idx: int,
+        first_nonbook: int,
+        nav_index_idx: Optional[int],
     ) -> bytes:
         # PalmDOC
         palmdoc = bytearray(PALMDOC_LEN)
@@ -953,6 +1117,8 @@ class MobiWriter:
         struct.pack_into(">H", mobi, OFF_FIRST_CONTENT, 1)
         struct.pack_into(">H", mobi, OFF_LAST_CONTENT, text_rec_count)
         struct.pack_into(">I", mobi, OFF_UNKNOWN_C4, 1)
+        struct.pack_into(">I", mobi, OFF_EXTRA_RECORD_DATA_FLAGS, 0)
+        struct.pack_into(">I", mobi, OFF_INDX, nav_index_idx if nav_index_idx is not None else INDX_INVALID)
 
         # EXTH Flag
         flags = struct.unpack_from(">I", mobi, OFF_EXTH_FLAGS)[0]
@@ -979,10 +1145,8 @@ class MobiWriter:
         if pad:
             record0.extend(b"\x00" * (4 - pad))
 
-        first_nonbook = flis_idx
-
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FIRST_NONBOOK, first_nonbook)
-        struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FIRST_IMAGE, first_nonbook)
+        struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FIRST_IMAGE, INDX_INVALID)
 
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FLIS_REC, flis_idx)
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FLIS_CNT, 1)
@@ -1029,24 +1193,31 @@ class MobiWriter:
         return bytes(pdb), bytes(rec_info)
 
     def build(self, output_file: str) -> None:
-        text_bytes = self._build_text_bytes()
+        layout = self._build_text_layout()
+        nav_records = self._build_navigation_records(layout)
+        text_bytes = layout.text_bytes
         uncompressed_records = self._safe_chunk_bytes(text_bytes, TEXT_RECORD_MAX)
         text_records = [self._compress_palmdoc(rec) for rec in uncompressed_records]
         self._validate_record_layout(
             text_rec_count=len(text_records),
-            total_records=1 + len(text_records) + 3,  # record0 + text + (flis, fcis, eof)
+            total_records=1 + len(text_records) + len(nav_records) + 3,
         )
 
-        flis_idx, fcis_idx = self._compute_record_indices(len(text_records))
+        flis_idx, fcis_idx = self._compute_record_indices(len(text_records), len(nav_records))
+        nav_index_idx = 1 + len(text_records) if nav_records else None
+        first_nonbook = nav_index_idx if nav_index_idx is not None else flis_idx
         record0 = self._build_record0(
             uncompressed_text_len=len(text_bytes),
             text_rec_count=len(text_records),
             flis_idx=flis_idx,
             fcis_idx=fcis_idx,
+            first_nonbook=first_nonbook,
+            nav_index_idx=nav_index_idx,
         )
 
         records: list[bytes] = [record0]
         records.extend(text_records)
+        records.extend(nav_records)
         records.extend([self._build_flis(), self._build_fcis(len(text_bytes)), self._build_eof()])
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)

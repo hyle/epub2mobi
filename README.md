@@ -8,11 +8,11 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 
 - Zero dependencies (`python3` only).
 - EPUB parsing via OPF manifest/spine with path normalization for ZIP internals.
-- Table of Contents generation with fixed-width `filepos` links.
+- Inline and logical Table of Contents generation for Kindle-compatible navigation.
 - TOC labels prioritized from NCX nav labels, then headings/titles, then body snippets/fallbacks.
 - Internal EPUB links and fragment targets are rewritten to work in the flattened MOBI output.
 - PalmDOC compression (type `2`), applied per 4096-byte uncompressed text record.
-- Legacy-compatible body sanitization (text/paragraphs/basic inline tags, with head/script/style content removed).
+- Legacy-compatible body sanitization.
 - Optional USB deploy to Kindle `documents` folder (`--deploy`).
 
 ## Requirements
@@ -31,15 +31,6 @@ Convert and deploy to a connected Kindle:
 
 ```bash
 python3 epub2mobi.py my_book.epub --deploy
-```
-
-## Module Usage
-
-```python
-from epub2mobi import parse_epub, MobiWriter
-
-epub_data = parse_epub("my_book.epub")
-MobiWriter(epub_data).build("my_book.mobi")
 ```
 
 ## Scope and Limitations
