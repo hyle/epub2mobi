@@ -133,6 +133,7 @@ class EpubData:
     uuid: str
     html_content: str
     toc_entries: tuple[tuple[str, str], ...]
+    image_records: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,13 @@ class TextLayout:
     text_bytes: bytes
     toc_filepos: Optional[int]
     toc_entry_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TocTarget:
+    path: str
+    fragment: Optional[str]
+    label: str
 
 
 def _palm_time_now() -> int:
@@ -265,6 +273,10 @@ def _normalize_epub_path(path: str) -> str:
     return posixpath.normpath(path.replace("\\", "/")).lstrip("/")
 
 
+def _is_supported_image_media_type(media_type: str) -> bool:
+    return media_type in {"image/jpeg", "image/png", "image/gif"}
+
+
 def _extract_body_html(html_str: str) -> str:
     lower = html_str.lower()
     body_open = lower.find("<body")
@@ -310,13 +322,86 @@ class FragmentIdCollector(HTMLParser):
                 self._seen.add(value)
 
 
+class ImageRefCollector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "img":
+            return
+        for key, value in attrs:
+            if key == "src" and value:
+                self.sources.append(value)
+                break
+
+
+def _extract_nav_toc_targets(
+    z: zipfile.ZipFile,
+    manifest_hrefs: dict[str, str],
+    manifest_media_types: dict[str, str],
+    manifest_properties: dict[str, str],
+    base_dir: str,
+) -> list[TocTarget]:
+    nav_href = None
+    for item_id, href in manifest_hrefs.items():
+        properties = manifest_properties.get(item_id, "")
+        media_type = manifest_media_types.get(item_id, "")
+        if "nav" in properties.split() and media_type == "application/xhtml+xml":
+            nav_href = href
+            break
+    if not nav_href:
+        return []
+
+    nav_path = _normalize_epub_path(posixpath.join(base_dir, nav_href))
+    try:
+        nav_root = _parse_xml(z.read(nav_path), nav_path)
+    except (KeyError, ValueError):
+        logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
+        return []
+
+    nav_base = posixpath.dirname(nav_path)
+    toc_nav = None
+    for elem in nav_root.iter():
+        if not elem.tag.endswith("nav"):
+            continue
+        nav_type = ""
+        for key, value in elem.attrib.items():
+            local_key = _strip_ns(key).lower()
+            if local_key == "type" and value:
+                nav_type = value
+                break
+        if "toc" in nav_type.split():
+            toc_nav = elem
+            break
+    if toc_nav is None:
+        return []
+
+    toc_targets: list[TocTarget] = []
+    for elem in toc_nav.iter():
+        if not elem.tag.endswith("a"):
+            continue
+        raw_href = elem.attrib.get("href")
+        if not raw_href:
+            continue
+        label = " ".join("".join(elem.itertext()).split())
+        if not label:
+            continue
+        resolved = _resolve_book_href(nav_path, raw_href)
+        if resolved is None:
+            continue
+        target_path, fragment = resolved
+        toc_targets.append(TocTarget(path=target_path, fragment=fragment, label=label))
+    return toc_targets
+
+
 def _build_ncx_label_map(
     z: zipfile.ZipFile,
     spine_node: ET.Element,
     manifest_hrefs: dict[str, str],
     manifest_media_types: dict[str, str],
     base_dir: str,
-) -> dict[str, str]:
+) -> list[TocTarget]:
     ncx_href = None
     toc_id = spine_node.attrib.get("toc")
     if toc_id:
@@ -328,17 +413,17 @@ def _build_ncx_label_map(
                 ncx_href = href
                 break
     if not ncx_href:
-        return {}
+        return []
 
     ncx_path = _normalize_epub_path(posixpath.join(base_dir, ncx_href))
     try:
         ncx_root = _parse_xml(z.read(ncx_path), ncx_path)
     except (KeyError, ValueError):
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
-        return {}
+        return []
 
     ncx_base = posixpath.dirname(ncx_path)
-    labels: dict[str, str] = {}
+    targets: list[TocTarget] = []
     for nav_point in ncx_root.iter():
         if not nav_point.tag.endswith("navPoint"):
             continue
@@ -353,16 +438,16 @@ def _build_ncx_label_map(
             if src is None and elem.tag.endswith("content"):
                 raw_src = elem.attrib.get("src")
                 if raw_src:
-                    # Collapse fragment targets to file-level labels since spine processing is file-based.
-                    src = raw_src.split("#", 1)[0]
+                    src = raw_src
 
         if not src or not label:
             continue
 
-        target = _normalize_epub_path(posixpath.join(ncx_base, src))
-        labels.setdefault(target, label)
+        target, _, fragment = src.partition("#")
+        target_path = _normalize_epub_path(posixpath.join(ncx_base, target))
+        targets.append(TocTarget(path=target_path, fragment=fragment or None, label=label))
 
-    return labels
+    return targets
 
 
 def _decode_xhtml(data: bytes) -> str:
@@ -435,6 +520,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
 
         manifest: dict[str, str] = {}
         manifest_media_types: dict[str, str] = {}
+        manifest_properties: dict[str, str] = {}
         for item in list(manifest_node):
             if _strip_ns(item.tag) == "item":
                 iid = item.attrib.get("id")
@@ -442,6 +528,11 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 if iid and href:
                     manifest[iid] = href
                     manifest_media_types[iid] = item.attrib.get("media-type", "")
+                    manifest_properties[iid] = item.attrib.get("properties", "")
+        manifest_paths = {
+            _normalize_epub_path(posixpath.join(base_dir, href)): iid
+            for iid, href in manifest.items()
+        }
 
         spine_refs: list[str] = []
         for itemref in list(spine_node):
@@ -453,7 +544,14 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             if rid:
                 spine_refs.append(rid)
 
-        ncx_labels = _build_ncx_label_map(
+        nav_targets = _extract_nav_toc_targets(
+            z=z,
+            manifest_hrefs=manifest,
+            manifest_media_types=manifest_media_types,
+            manifest_properties=manifest_properties,
+            base_dir=base_dir,
+        )
+        ncx_targets = _build_ncx_label_map(
             z=z,
             spine_node=spine_node,
             manifest_hrefs=manifest,
@@ -494,10 +592,36 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             for fragment_idx, fragment in enumerate(collector.fragments, start=1):
                 fragment_anchor_map[(item.full_path, fragment)] = f"{item.anchor}_frag_{fragment_idx}"
 
-        parts: list[str] = []
-        raw_toc: list[tuple[str, str, str, int]] = []
+        image_path_to_recindex: dict[str, int] = {}
+        image_records: list[bytes] = []
         for item in spine_items:
-            ncx_title = ncx_labels.get(item.full_path)
+            collector = ImageRefCollector()
+            collector.feed(item.body_html)
+            collector.close()
+            for raw_src in collector.sources:
+                resolved = _resolve_book_href(item.full_path, raw_src)
+                if resolved is None:
+                    continue
+                target_path, _fragment = resolved
+                if target_path in image_path_to_recindex:
+                    continue
+                item_id = manifest_paths.get(target_path)
+                if item_id is None:
+                    continue
+                media_type = manifest_media_types.get(item_id, "")
+                if not _is_supported_image_media_type(media_type):
+                    continue
+                try:
+                    image_records.append(z.read(target_path))
+                except KeyError:
+                    logger.warning("Missing image in EPUB: %s", target_path)
+                    continue
+                image_path_to_recindex[target_path] = len(image_records)
+
+        parts: list[str] = []
+        fallback_toc: list[tuple[str, str, str, int]] = []
+        for item in spine_items:
+            ncx_title = next((target.label for target in ncx_targets if target.path == item.full_path and target.fragment is None), None)
             guessed_title = _extract_title(item.raw_html)
             chapter_title = ncx_title or guessed_title
             if (
@@ -512,13 +636,33 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 current_path=item.full_path,
                 file_anchor_map=file_anchor_map,
                 fragment_anchor_map=fragment_anchor_map,
+                image_path_to_recindex=image_path_to_recindex,
             )
             clean = sanitizer.sanitize(item.body_html)
             if clean:
-                raw_toc.append((item.anchor, chapter_title, item.stem, item.index))
+                fallback_toc.append((item.anchor, chapter_title, item.stem, item.index))
                 parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
                 parts.append(clean)
                 parts.append("<mbp:pagebreak/>")
+
+        source_targets = nav_targets or ncx_targets
+        raw_toc: list[tuple[str, str, str, int]] = []
+        seen_anchors: set[str] = set()
+        for target in source_targets:
+            if target.fragment:
+                anchor = fragment_anchor_map.get((target.path, target.fragment))
+            else:
+                anchor = file_anchor_map.get(target.path)
+            if anchor is None or anchor in seen_anchors:
+                continue
+            spine_item = next((item for item in spine_items if item.full_path == target.path), None)
+            if spine_item is None:
+                continue
+            seen_anchors.add(anchor)
+            raw_toc.append((anchor, target.label, spine_item.stem, spine_item.index))
+
+        if not raw_toc:
+            raw_toc = fallback_toc
 
         label_counts: dict[str, int] = {}
         for _, label, _, _ in raw_toc:
@@ -545,6 +689,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             uuid=book_uuid,
             html_content=html_content,
             toc_entries=tuple(toc_entries),
+            image_records=tuple(image_records),
         )
 
 
@@ -565,33 +710,91 @@ class MinimalHtmlSanitizer(HTMLParser):
             "ol",
             "li",
             "br",
+            "hr",
+            "table",
+            "thead",
+            "tbody",
+            "tfoot",
+            "tr",
+            "td",
+            "th",
         }
     )
     _INLINE: frozenset[str] = frozenset(
-        {"b", "i", "strong", "em", "code", "span", "a", "mbp:pagebreak"}
+        {"b", "i", "strong", "em", "code", "span", "a", "img", "mbp:pagebreak"}
     )
     _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
 
     _SUPPRESSED: frozenset[str] = frozenset({"script", "style"})
+    _HEADING_HINTS: frozenset[str] = frozenset({"chapter-title", "chap-title", "heading", "chapterhead", "chapter-heading"})
+    _CENTER_HINTS: frozenset[str] = frozenset({"center", "centre", "centered", "centred", "epigraph", "ornament", "separator", "scene-break", "scenebreak", "asterism", "dinkus"})
+    _RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "credit", "byline", "source"})
 
     def __init__(
         self,
         current_path: str,
         file_anchor_map: dict[str, str],
         fragment_anchor_map: dict[tuple[str, str], str],
+        image_path_to_recindex: dict[str, int],
     ):
         super().__init__(convert_charrefs=True)
         self.current_path = current_path
         self.file_anchor_map = file_anchor_map
         self.fragment_anchor_map = fragment_anchor_map
+        self.image_path_to_recindex = image_path_to_recindex
         self.fed: list[str] = []
         self._suppressed_depth = 0
+        self._table_stack: list[tuple[bool, int]] = []
+        self._output_tag_stack: list[Optional[str]] = []
 
     def _ensure_block_sep(self) -> None:
         if self.fed:
             last = self.fed[-1]
             if last and last[-1] != "\n":
                 self.fed.append("\n")
+
+    @staticmethod
+    def _attr_map(attrs) -> dict[str, str]:
+        return {k.lower(): (v or "") for k, v in attrs}
+
+    @staticmethod
+    def _tokenize_hints(*values: str) -> set[str]:
+        tokens: set[str] = set()
+        for value in values:
+            tokens.update(token for token in re.split(r"[^a-z0-9_-]+", value.lower()) if token)
+        return tokens
+
+    @staticmethod
+    def _derive_alignment(style: str, hint_tokens: set[str]) -> Optional[str]:
+        normalized = style.lower().replace(" ", "")
+        if "text-align:center" in normalized or ("margin-left:auto" in normalized and "margin-right:auto" in normalized):
+            return "center"
+        if "text-align:right" in normalized:
+            return "right"
+        if hint_tokens & MinimalHtmlSanitizer._CENTER_HINTS:
+            return "center"
+        if hint_tokens & MinimalHtmlSanitizer._RIGHT_HINTS:
+            return "right"
+        return None
+
+    def _table_is_simple(self, tag: str, attr_map: dict[str, str]) -> bool:
+        if tag == "table" and self._table_stack:
+            return False
+        for key in ("rowspan", "colspan"):
+            value = attr_map.get(key, "").strip()
+            if value and value not in {"1", ""}:
+                return False
+        return True
+
+    def _in_simple_table(self) -> bool:
+        return bool(self._table_stack and self._table_stack[-1][0])
+
+    def _mark_current_table_complex(self) -> None:
+        if not self._table_stack or not self._table_stack[-1][0]:
+            return
+        _is_simple, start_idx = self._table_stack[-1]
+        del self.fed[start_idx:]
+        self._table_stack[-1] = (False, start_idx)
 
     def _inject_named_anchors(self, attrs) -> None:
         seen: set[str] = set()
@@ -622,6 +825,8 @@ class MinimalHtmlSanitizer(HTMLParser):
     def sanitize(self, html_str: str) -> str:
         self.fed = []
         self._suppressed_depth = 0
+        self._table_stack = []
+        self._output_tag_stack = []
         self.reset()
         self.feed(html_str)
         self.close()
@@ -633,44 +838,96 @@ class MinimalHtmlSanitizer(HTMLParser):
             return
 
         self._inject_named_anchors(attrs)
+        attr_map = self._attr_map(attrs)
+        hint_tokens = self._tokenize_hints(attr_map.get("class", ""), attr_map.get("id", ""))
+        effective_tag = tag
+
+        if tag in {"p", "div"} and hint_tokens & self._HEADING_HINTS:
+            effective_tag = "h2"
+
+        if tag == "table":
+            if self._table_stack:
+                self._mark_current_table_complex()
+            self._table_stack.append((self._table_is_simple(tag, attr_map), len(self.fed)))
+        elif tag in {"td", "th"} and not self._table_is_simple(tag, attr_map) and self._table_stack:
+            self._mark_current_table_complex()
+        elif tag in {"thead", "tbody", "tfoot", "tr", "td", "th"} and self._table_stack and not self._table_stack[-1][0]:
+            pass
+
         if tag in self._ALLOWED:
-            if tag in ("br", "mbp:pagebreak"):
+            if tag in {"thead", "tbody", "tfoot", "tr", "td", "th", "table"} and self._table_stack and not self._table_stack[-1][0]:
+                if tag in {"td", "th"}:
+                    self.fed.append(" ")
+                if tag not in {"br", "mbp:pagebreak", "hr", "img"}:
+                    self._output_tag_stack.append(None)
+                return
+            if tag in ("br", "mbp:pagebreak", "hr"):
                 self.fed.append(f"<{tag}/>")
+                return
+            if tag == "img":
+                src = attr_map.get("src", "")
+                resolved = _resolve_book_href(self.current_path, src) if src else None
+                recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
+                if recindex is not None:
+                    self.fed.append(f'<img recindex="{recindex}"/>')
                 return
 
             # Reconstruct the tag
             attr_str = ""
             # Only keep 'href' for anchors, ignore classes/styles as legacy MOBI ignores them mostly
-            if tag == "a":
+            if effective_tag == "a":
                 for k, v in attrs:
                     if k == "href":
                         rewritten = self._rewrite_href(v)
                         if rewritten:
                             attr_str = f' href="{htmlmod.escape(rewritten, quote=True)}"'
                         break
+            elif effective_tag in self._BLOCKS:
+                align = self._derive_alignment(attr_map.get("style", ""), hint_tokens)
+                if align:
+                    attr_str = f' align="{align}"'
 
             # Map modern semantics to legacy
-            if tag == "strong": tag = "b"
-            if tag == "em": tag = "i"
+            if effective_tag == "strong": effective_tag = "b"
+            if effective_tag == "em": effective_tag = "i"
 
-            if tag in self._BLOCKS:
+            if effective_tag in self._BLOCKS:
                 self._ensure_block_sep()
-            self.fed.append(f"<{tag}{attr_str}>")
+            self.fed.append(f"<{effective_tag}{attr_str}>")
+            self._output_tag_stack.append(effective_tag)
+        elif tag not in {"br", "mbp:pagebreak", "hr", "img"}:
+            self._output_tag_stack.append(None)
 
     def handle_endtag(self, tag):
         if tag in self._SUPPRESSED:
             self._suppressed_depth = max(0, self._suppressed_depth - 1)
             return
 
-        # Map modern semantics to legacy
-        if tag == "strong": tag = "b"
-        if tag == "em": tag = "i"
+        output_tag = self._output_tag_stack.pop() if self._output_tag_stack else None
 
-        if tag in self._ALLOWED and tag not in ("br", "mbp:pagebreak"):
-            self.fed.append(f"</{tag}>")
+        if tag == "table" and self._table_stack:
+            is_simple, _start_idx = self._table_stack.pop()
+            if not is_simple:
+                self.fed.append("\n")
+                return
+        elif tag in {"thead", "tbody", "tfoot", "tr", "td", "th"} and self._table_stack and not self._table_stack[-1][0]:
+            if tag == "tr":
+                self.fed.append("\n")
+            elif tag in {"td", "th"}:
+                self.fed.append(" ")
+            return
+
+        # Map modern semantics to legacy
+        if output_tag is None:
+            return
+        if output_tag in {"hr", "img"}:
+            return
+
+        if output_tag in self._ALLOWED and output_tag not in ("br", "mbp:pagebreak"):
+            self.fed.append(f"</{output_tag}>")
 
             # Legacy Kindle sometimes merges block elements if there isn't a newline
-            if tag in self._BLOCKS:
+            if output_tag in self._BLOCKS:
                 self.fed.append("\n")
 
     def handle_startendtag(self, tag, attrs):
@@ -681,6 +938,15 @@ class MinimalHtmlSanitizer(HTMLParser):
         if tag in self._ALLOWED:
             if tag == "br":
                 self.fed.append("<br/>")
+            elif tag == "hr":
+                self.fed.append("<hr/>")
+            elif tag == "img":
+                attr_map = self._attr_map(attrs)
+                src = attr_map.get("src", "")
+                resolved = _resolve_book_href(self.current_path, src) if src else None
+                recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
+                if recindex is not None:
+                    self.fed.append(f'<img recindex="{recindex}"/>')
             elif tag == "mbp:pagebreak":
                 self.fed.append("<mbp:pagebreak/>")
 
@@ -1082,6 +1348,7 @@ class MobiWriter:
         fcis_idx: int,
         first_nonbook: int,
         nav_index_idx: Optional[int],
+        first_image_idx: Optional[int],
     ) -> bytes:
         # PalmDOC
         palmdoc = bytearray(PALMDOC_LEN)
@@ -1146,7 +1413,12 @@ class MobiWriter:
             record0.extend(b"\x00" * (4 - pad))
 
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FIRST_NONBOOK, first_nonbook)
-        struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FIRST_IMAGE, INDX_INVALID)
+        struct.pack_into(
+            ">I",
+            record0,
+            PALMDOC_LEN + OFF_FIRST_IMAGE,
+            first_image_idx if first_image_idx is not None else INDX_INVALID,
+        )
 
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FLIS_REC, flis_idx)
         struct.pack_into(">I", record0, PALMDOC_LEN + OFF_FLIS_CNT, 1)
@@ -1196,16 +1468,22 @@ class MobiWriter:
         layout = self._build_text_layout()
         nav_records = self._build_navigation_records(layout)
         text_bytes = layout.text_bytes
+        image_records = list(self.epub.image_records)
         uncompressed_records = self._safe_chunk_bytes(text_bytes, TEXT_RECORD_MAX)
         text_records = [self._compress_palmdoc(rec) for rec in uncompressed_records]
         self._validate_record_layout(
             text_rec_count=len(text_records),
-            total_records=1 + len(text_records) + len(nav_records) + 3,
+            total_records=1 + len(text_records) + len(nav_records) + len(image_records) + 3,
         )
 
-        flis_idx, fcis_idx = self._compute_record_indices(len(text_records), len(nav_records))
+        flis_idx, fcis_idx = self._compute_record_indices(
+            len(text_records),
+            len(nav_records) + len(image_records),
+        )
         nav_index_idx = 1 + len(text_records) if nav_records else None
-        first_nonbook = nav_index_idx if nav_index_idx is not None else flis_idx
+        first_image_idx = 1 + len(text_records) + len(nav_records) if image_records else None
+        first_nonbook_candidates = [idx for idx in (nav_index_idx, first_image_idx, flis_idx) if idx is not None]
+        first_nonbook = min(first_nonbook_candidates)
         record0 = self._build_record0(
             uncompressed_text_len=len(text_bytes),
             text_rec_count=len(text_records),
@@ -1213,11 +1491,13 @@ class MobiWriter:
             fcis_idx=fcis_idx,
             first_nonbook=first_nonbook,
             nav_index_idx=nav_index_idx,
+            first_image_idx=first_image_idx,
         )
 
         records: list[bytes] = [record0]
         records.extend(text_records)
         records.extend(nav_records)
+        records.extend(image_records)
         records.extend([self._build_flis(), self._build_fcis(len(text_bytes)), self._build_eof()])
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)
