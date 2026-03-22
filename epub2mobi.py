@@ -5,6 +5,7 @@ EPUB2 -> MOBI6 generator (Legacy Kindle Target)
 
 from __future__ import annotations
 
+import argparse
 import html as htmlmod
 import logging
 import os
@@ -56,6 +57,9 @@ TOC_FILEPOS_MAX = 10 ** TOC_FILEPOS_WIDTH
 
 # XML parsing guardrails for untrusted EPUBs
 MAX_XML_BYTES = 8 * 1024 * 1024
+MAX_XHTML_BYTES = 16 * 1024 * 1024
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
 _XML_UNSAFE_DECL_RE = re.compile(br"<!\s*ENTITY\b", flags=re.IGNORECASE)
 
 # EXTH Types
@@ -422,7 +426,6 @@ def _build_ncx_label_map(
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
         return []
 
-    ncx_base = posixpath.dirname(ncx_path)
     targets: list[TocTarget] = []
     for nav_point in ncx_root.iter():
         if not nav_point.tag.endswith("navPoint"):
@@ -443,11 +446,41 @@ def _build_ncx_label_map(
         if not src or not label:
             continue
 
-        target, _, fragment = src.partition("#")
-        target_path = _normalize_epub_path(posixpath.join(ncx_base, target))
-        targets.append(TocTarget(path=target_path, fragment=fragment or None, label=label))
+        resolved = _resolve_book_href(ncx_path, src)
+        if resolved is None:
+            continue
+        target_path, fragment = resolved
+        targets.append(TocTarget(path=target_path, fragment=fragment, label=label))
 
     return targets
+
+
+def _read_zip_member(
+    z: zipfile.ZipFile,
+    member_path: str,
+    *,
+    size_limit: int,
+    aggregate_budget: int,
+    aggregate_used: int,
+    kind: str,
+) -> tuple[bytes, int]:
+    try:
+        info = z.getinfo(member_path)
+    except KeyError as e:
+        raise KeyError(member_path) from e
+
+    if info.file_size > size_limit:
+        raise ValueError(
+            f"{kind} too large: {member_path} ({info.file_size} bytes > {size_limit} bytes)"
+        )
+
+    new_total = aggregate_used + info.file_size
+    if new_total > aggregate_budget:
+        raise ValueError(
+            f"EPUB content too large: extracting {member_path} would exceed {aggregate_budget} bytes"
+        )
+
+    return z.read(member_path), new_total
 
 
 def _decode_xhtml(data: bytes) -> str:
@@ -559,17 +592,25 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             base_dir=base_dir,
         )
 
+        extracted_resource_bytes = 0
         spine_items: list[SpineItem] = []
         for spine_idx, item_id in enumerate(spine_refs, start=1):
             rel = manifest.get(item_id)
             if not rel:
-                continue
+                raise ValueError(f"Malformed OPF: spine item '{item_id}' is missing from manifest")
             full = _normalize_epub_path(posixpath.join(base_dir, rel))
             try:
-                raw = _decode_xhtml(z.read(full))
-            except KeyError:
-                logger.warning("Missing file in EPUB: %s", full)
-                continue
+                raw_bytes, extracted_resource_bytes = _read_zip_member(
+                    z,
+                    full,
+                    size_limit=MAX_XHTML_BYTES,
+                    aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+                    aggregate_used=extracted_resource_bytes,
+                    kind="Spine XHTML",
+                )
+            except KeyError as e:
+                raise ValueError(f"Missing spine item in EPUB: {full}") from e
+            raw = _decode_xhtml(raw_bytes)
             body_html = _extract_body_html(raw)
             spine_items.append(
                 SpineItem(
@@ -612,10 +653,18 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 if not _is_supported_image_media_type(media_type):
                     continue
                 try:
-                    image_records.append(z.read(target_path))
+                    image_data, extracted_resource_bytes = _read_zip_member(
+                        z,
+                        target_path,
+                        size_limit=MAX_IMAGE_BYTES,
+                        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+                        aggregate_used=extracted_resource_bytes,
+                        kind="Image resource",
+                    )
                 except KeyError:
                     logger.warning("Missing image in EPUB: %s", target_path)
                     continue
+                image_records.append(image_data)
                 image_path_to_recindex[target_path] = len(image_records)
 
         parts: list[str] = []
@@ -1550,26 +1599,42 @@ def deploy_to_kindle(source_file: str) -> None:
     logger.warning("No Kindle detected.")
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: python3 epub2mobi.py <input.epub> [--deploy]")
-        return
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Convert EPUB files to legacy MOBI6.")
+    parser.add_argument("input_epub", help="Path to the input EPUB file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_mobi",
+        help="Path to the output MOBI file (defaults to input path with .mobi suffix)",
+    )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="Copy the generated MOBI to a connected Kindle if one is detected",
+    )
+    return parser
 
-    infile = sys.argv[1]
-    do_deploy = "--deploy" in sys.argv
-    outfile = Path(infile).with_suffix(".mobi")
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+
+    infile = Path(args.input_epub)
+    outfile = Path(args.output_mobi) if args.output_mobi else infile.with_suffix(".mobi")
 
     try:
         epub_data = parse_epub(infile)
         MobiWriter(epub_data).build(str(outfile))
 
-        if do_deploy:
+        if args.deploy:
             deploy_to_kindle(str(outfile))
 
+        return 0
     except Exception as e:
         logger.error("Error: %s", e)
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
