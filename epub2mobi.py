@@ -18,7 +18,10 @@ import urllib.parse
 import zipfile
 import zlib
 # Note: Standard ET is not secure against maliciously constructed XML data
-import xml.etree.ElementTree as ET
+try:
+    import defusedxml.ElementTree as ET
+except ImportError:
+    import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass
 from datetime import datetime
