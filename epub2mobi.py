@@ -1636,7 +1636,8 @@ class MobiWriter:
 
         # Content Range
         struct.pack_into(">H", mobi, OFF_FIRST_CONTENT, 1)
-        struct.pack_into(">H", mobi, OFF_LAST_CONTENT, text_rec_count)
+        # Navigation and image records are content; FLIS starts the trailing metadata.
+        struct.pack_into(">H", mobi, OFF_LAST_CONTENT, flis_idx - 1)
         struct.pack_into(">I", mobi, OFF_UNKNOWN_C4, 1)
         struct.pack_into(">I", mobi, OFF_EXTRA_RECORD_DATA_FLAGS, 0)
         struct.pack_into(">I", mobi, OFF_INDX, nav_index_idx if nav_index_idx is not None else INDX_INVALID)
