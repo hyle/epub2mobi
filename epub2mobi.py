@@ -131,6 +131,13 @@ def _strip_ns(tag: str) -> str:
 
 
 @dataclass(frozen=True)
+class MediaOmission:
+    resource: str
+    source: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class EpubData:
     title: str
     author: str
@@ -138,6 +145,7 @@ class EpubData:
     html_content: str
     toc_entries: tuple[tuple[str, str], ...]
     image_records: tuple[bytes, ...] = ()
+    omitted_media: tuple[MediaOmission, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,7 +301,7 @@ def _resolve_manifest_path(base_dir: str, href: str) -> str:
 
 
 def _is_supported_image_media_type(media_type: str) -> bool:
-    return media_type in {"image/jpeg", "image/png", "image/gif"}
+    return media_type.lower() in {"image/jpeg", "image/png", "image/gif"}
 
 
 def _extract_body_html(html_str: str) -> str:
@@ -328,6 +336,15 @@ def _resolve_book_href(current_path: str, href: str) -> Optional[Tuple[str, Opti
     return target_path, fragment
 
 
+def _reported_media_path(current_path: str, href: Optional[str], fallback: str) -> str:
+    if not href:
+        return fallback
+    if href.startswith("data:"):
+        return "<data URI>"
+    resolved = _resolve_book_href(current_path, href)
+    return resolved[0] if resolved else href
+
+
 class FragmentIdCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -347,18 +364,44 @@ class BodyIdCollector(FragmentIdCollector):
             super().handle_starttag(tag, attrs)
 
 
-class ImageRefCollector(HTMLParser):
+class MediaRefCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.sources: list[str] = []
+        self.image_sources: list[Optional[str]] = []
+        self.unsupported: list[tuple[str, Optional[str]]] = []
+        self.inline_svg = False
+        self._media_stack: list[tuple[str, bool]] = []
 
     def handle_starttag(self, tag, attrs):
-        if tag != "img":
-            return
-        for key, value in attrs:
-            if key == "src" and value:
-                self.sources.append(value)
-                break
+        attributes = dict(attrs)
+        if tag == "img":
+            self.image_sources.append(attributes.get("src"))
+        elif tag == "svg":
+            self.inline_svg = True
+        elif tag in {"audio", "video"}:
+            src = attributes.get("src")
+            self._media_stack.append((tag, bool(src)))
+            if src:
+                self.unsupported.append((tag, src))
+        elif tag == "source" and self._media_stack:
+            src = attributes.get("src")
+            if src:
+                kind, _ = self._media_stack[-1]
+                self.unsupported.append((kind, src))
+                self._media_stack[-1] = (kind, True)
+        elif tag in {"object", "embed"}:
+            self.unsupported.append((tag, attributes.get("data" if tag == "object" else "src")))
+
+    def handle_endtag(self, tag):
+        if tag in {"audio", "video"} and self._media_stack:
+            kind, has_source = self._media_stack.pop()
+            if not has_source:
+                self.unsupported.append((kind, None))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag in {"audio", "video"}:
+            self.handle_endtag(tag)
 
 
 def _extract_nav_toc_targets(
@@ -608,6 +651,33 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             for iid, href in manifest.items()
         }
 
+        omissions: list[MediaOmission] = []
+        seen_omissions: set[MediaOmission] = set()
+
+        def record_omission(resource: str, source: str, reason: str) -> None:
+            omission = MediaOmission(resource=resource, source=source, reason=reason)
+            if omission not in seen_omissions:
+                omissions.append(omission)
+                seen_omissions.add(omission)
+
+        font_media_types = {
+            "application/font-sfnt", "application/vnd.ms-opentype",
+            "application/x-font-ttf", "application/x-font-otf",
+        }
+        for item_id, href in manifest.items():
+            media_type = manifest_media_types[item_id].lower()
+            resource_path = urllib.parse.urlsplit(href).path.lower()
+            is_font = (
+                media_type.startswith("font/")
+                or media_type in font_media_types
+                or resource_path.endswith((".ttf", ".otf", ".woff", ".woff2"))
+            )
+            if is_font:
+                record_omission(
+                    _resolve_manifest_path(base_dir, href), opf_path,
+                    "declared font is not embedded",
+                )
+
         linear_refs: list[tuple[str, bool]] = []
         auxiliary_refs: list[tuple[str, bool]] = []
         for itemref in list(spine_node):
@@ -636,11 +706,15 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
 
         extracted_resource_bytes = 0
         spine_items: list[SpineItem] = []
+        svg_spine_paths: set[str] = set()
         for spine_idx, (item_id, linear) in enumerate(spine_refs, start=1):
             rel = manifest.get(item_id)
             if not rel:
                 raise ValueError(f"Malformed OPF: spine item '{item_id}' is missing from manifest")
             full = _resolve_manifest_path(base_dir, rel)
+            if manifest_media_types.get(item_id, "").lower() == "image/svg+xml":
+                svg_spine_paths.add(full)
+                record_omission(full, opf_path, "SVG spine content is not rendered")
             try:
                 raw_bytes, extracted_resource_bytes = _read_zip_member(
                     z,
@@ -685,21 +759,34 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         image_path_to_recindex: dict[str, int] = {}
         image_records: list[bytes] = []
         for item in spine_items:
-            collector = ImageRefCollector()
+            collector = MediaRefCollector()
             collector.feed(item.body_html)
             collector.close()
-            for raw_src in collector.sources:
+            if collector.inline_svg and item.full_path not in svg_spine_paths:
+                record_omission("<inline SVG>", item.full_path, "inline SVG is not rendered")
+            for kind, raw_src in collector.unsupported:
+                resource = _reported_media_path(item.full_path, raw_src, f"<{kind}>")
+                record_omission(resource, item.full_path, f"{kind} is not supported")
+
+            for raw_src in collector.image_sources:
+                if not raw_src:
+                    record_omission("<img without src>", item.full_path, "image has no source")
+                    continue
                 resolved = _resolve_book_href(item.full_path, raw_src)
                 if resolved is None:
+                    resource = "<data URI>" if raw_src.startswith("data:") else raw_src
+                    record_omission(resource, item.full_path, "external or data URI image is not embedded")
                     continue
                 target_path, _fragment = resolved
                 if target_path in image_path_to_recindex:
                     continue
                 item_id = manifest_paths.get(target_path)
                 if item_id is None:
+                    record_omission(target_path, item.full_path, "image is not declared in the EPUB manifest")
                     continue
                 media_type = manifest_media_types.get(item_id, "")
                 if not _is_supported_image_media_type(media_type):
+                    record_omission(target_path, item.full_path, f"unsupported image format: {media_type or 'unspecified'}")
                     continue
                 try:
                     image_data, extracted_resource_bytes = _read_zip_member(
@@ -711,7 +798,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                         kind="Image resource",
                     )
                 except KeyError:
-                    logger.warning("Missing image in EPUB: %s", target_path)
+                    record_omission(target_path, item.full_path, "image file is missing from the EPUB")
                     continue
                 image_records.append(image_data)
                 image_path_to_recindex[target_path] = len(image_records)
@@ -789,6 +876,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             html_content=html_content,
             toc_entries=tuple(toc_entries),
             image_records=tuple(image_records),
+            omitted_media=tuple(omissions),
         )
 
 
@@ -1706,7 +1794,32 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Copy the generated MOBI to a connected Kindle if one is detected",
     )
+    parser.add_argument(
+        "--report-omissions",
+        action="store_true",
+        help="List media resources that were omitted from the MOBI output",
+    )
     return parser
+
+
+def _log_media_omissions(omissions: tuple[MediaOmission, ...], detailed: bool) -> None:
+    if not omissions:
+        if detailed:
+            logger.info("No omissions detected by the media scan; CSS assets were not inspected.")
+        return
+
+    logger.warning(
+        "%d media omission%s detected%s",
+        len(omissions),
+        "" if len(omissions) == 1 else "s",
+        ":" if detailed else " (use --report-omissions for details).",
+    )
+    if detailed:
+        for omission in omissions:
+            logger.warning(
+                "  %s — %s (referenced in %s)",
+                omission.resource, omission.reason, omission.source,
+            )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1721,6 +1834,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise ValueError("Output path resolves to the input EPUB; choose a different output path")
         epub_data = parse_epub(infile)
         MobiWriter(epub_data).build(str(outfile))
+        _log_media_omissions(epub_data.omitted_media, args.report_omissions)
 
         if args.deploy:
             deploy_to_kindle(str(outfile))
