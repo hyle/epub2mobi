@@ -19,6 +19,7 @@ import zipfile
 import zlib
 # Note: Standard ET is not secure against maliciously constructed XML data
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -60,7 +61,6 @@ MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_XHTML_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
-_XML_UNSAFE_DECL_RE = re.compile(br"<!\s*ENTITY\b", flags=re.IGNORECASE)
 
 # EXTH Types
 EXTH_AUTHOR = 100
@@ -149,6 +149,8 @@ class SpineItem:
     stem: str
     raw_html: str
     body_html: str
+    body_fragments: tuple[str, ...]
+    linear: bool
 
 
 @dataclass(frozen=True)
@@ -202,18 +204,24 @@ def _encode_vwi(value: int) -> bytes:
 def _parse_xml(data: bytes, source_name: str) -> ET.Element:
     if len(data) > MAX_XML_BYTES:
         raise ValueError(f"XML file too large: {source_name}")
-    # Block DTD/entity declarations to avoid expansion attacks in untrusted input.
-    if _XML_UNSAFE_DECL_RE.search(data):
+    # Expat sees declarations regardless of whether the XML is UTF-8, UTF-16, or UTF-32.
+    guard = expat.ParserCreate()
+
+    def reject_entity(*_args):
         raise ValueError(f"Unsafe XML declaration in {source_name}")
+
+    guard.EntityDeclHandler = reject_entity
+    guard.ExternalEntityRefHandler = reject_entity
     try:
+        guard.Parse(data, True)
         return ET.fromstring(data)
-    except ET.ParseError as e:
+    except (ET.ParseError, expat.ExpatError) as e:
         raise ValueError(f"Malformed XML: {source_name}") from e
 
 
 def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
     try:
-        txt = z.read("META-INF/container.xml")
+        txt = _read_xml_member(z, "META-INF/container.xml")
     except KeyError as e:
         raise ValueError("Invalid EPUB container: missing META-INF/container.xml") from e
 
@@ -229,7 +237,7 @@ def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
     if not opf_path:
         raise ValueError("Invalid EPUB container: no rootfile in META-INF/container.xml")
 
-    normalized_opf = posixpath.normpath(opf_path.replace("\\", "/")).lstrip("/")
+    normalized_opf = _normalize_epub_path(urllib.parse.unquote(opf_path))
     if normalized_opf in ("", "."):
         raise ValueError("Invalid EPUB container: empty OPF path")
     return normalized_opf, posixpath.dirname(normalized_opf)
@@ -275,6 +283,13 @@ def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -
 
 def _normalize_epub_path(path: str) -> str:
     return posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+
+
+def _resolve_manifest_path(base_dir: str, href: str) -> str:
+    parsed = urllib.parse.urlsplit(href)
+    if parsed.scheme or parsed.netloc:
+        raise ValueError(f"Invalid EPUB manifest href: {href}")
+    return _normalize_epub_path(posixpath.join(base_dir, urllib.parse.unquote(parsed.path)))
 
 
 def _is_supported_image_media_type(media_type: str) -> bool:
@@ -326,6 +341,12 @@ class FragmentIdCollector(HTMLParser):
                 self._seen.add(value)
 
 
+class BodyIdCollector(FragmentIdCollector):
+    def handle_starttag(self, tag, attrs):
+        if tag == "body":
+            super().handle_starttag(tag, attrs)
+
+
 class ImageRefCollector(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -357,14 +378,13 @@ def _extract_nav_toc_targets(
     if not nav_href:
         return []
 
-    nav_path = _normalize_epub_path(posixpath.join(base_dir, nav_href))
+    nav_path = _resolve_manifest_path(base_dir, nav_href)
     try:
-        nav_root = _parse_xml(z.read(nav_path), nav_path)
+        nav_root = _parse_xml(_read_xml_member(z, nav_path), nav_path)
     except (KeyError, ValueError):
         logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
         return []
 
-    nav_base = posixpath.dirname(nav_path)
     toc_nav = None
     for elem in nav_root.iter():
         if not elem.tag.endswith("nav"):
@@ -419,9 +439,9 @@ def _build_ncx_label_map(
     if not ncx_href:
         return []
 
-    ncx_path = _normalize_epub_path(posixpath.join(base_dir, ncx_href))
+    ncx_path = _resolve_manifest_path(base_dir, ncx_href)
     try:
-        ncx_root = _parse_xml(z.read(ncx_path), ncx_path)
+        ncx_root = _parse_xml(_read_xml_member(z, ncx_path), ncx_path)
     except (KeyError, ValueError):
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
         return []
@@ -480,7 +500,28 @@ def _read_zip_member(
             f"EPUB content too large: extracting {member_path} would exceed {aggregate_budget} bytes"
         )
 
-    return z.read(member_path), new_total
+    with z.open(member_path) as member:
+        data = member.read(size_limit + 1)
+    if len(data) > size_limit:
+        raise ValueError(f"{kind} too large: {member_path}")
+    actual_total = aggregate_used + len(data)
+    if actual_total > aggregate_budget:
+        raise ValueError(
+            f"EPUB content too large: extracting {member_path} would exceed {aggregate_budget} bytes"
+        )
+    return data, actual_total
+
+
+def _read_xml_member(z: zipfile.ZipFile, member_path: str) -> bytes:
+    data, _ = _read_zip_member(
+        z,
+        member_path,
+        size_limit=MAX_XML_BYTES,
+        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+        aggregate_used=0,
+        kind="XML file",
+    )
+    return data
 
 
 def _decode_xhtml(data: bytes) -> str:
@@ -513,7 +554,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
     with zipfile.ZipFile(filepath, "r") as z:
         opf_path, base_dir = _find_opf(z)
         try:
-            opf_xml = z.read(opf_path)
+            opf_xml = _read_xml_member(z, opf_path)
         except KeyError as e:
             raise ValueError(f"OPF declared in container is missing: {opf_path}") from e
         opf_root = _parse_xml(opf_xml, opf_path)
@@ -563,19 +604,20 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     manifest_media_types[iid] = item.attrib.get("media-type", "")
                     manifest_properties[iid] = item.attrib.get("properties", "")
         manifest_paths = {
-            _normalize_epub_path(posixpath.join(base_dir, href)): iid
+            _resolve_manifest_path(base_dir, href): iid
             for iid, href in manifest.items()
         }
 
-        spine_refs: list[str] = []
+        linear_refs: list[tuple[str, bool]] = []
+        auxiliary_refs: list[tuple[str, bool]] = []
         for itemref in list(spine_node):
             if _strip_ns(itemref.tag) != "itemref":
                 continue
-            if itemref.attrib.get("linear", "yes").strip().lower() == "no":
-                continue
             rid = itemref.attrib.get("idref")
             if rid:
-                spine_refs.append(rid)
+                linear = itemref.attrib.get("linear", "yes").strip().lower() != "no"
+                (linear_refs if linear else auxiliary_refs).append((rid, linear))
+        spine_refs = linear_refs + auxiliary_refs
 
         nav_targets = _extract_nav_toc_targets(
             z=z,
@@ -594,11 +636,11 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
 
         extracted_resource_bytes = 0
         spine_items: list[SpineItem] = []
-        for spine_idx, item_id in enumerate(spine_refs, start=1):
+        for spine_idx, (item_id, linear) in enumerate(spine_refs, start=1):
             rel = manifest.get(item_id)
             if not rel:
                 raise ValueError(f"Malformed OPF: spine item '{item_id}' is missing from manifest")
-            full = _normalize_epub_path(posixpath.join(base_dir, rel))
+            full = _resolve_manifest_path(base_dir, rel)
             try:
                 raw_bytes, extracted_resource_bytes = _read_zip_member(
                     z,
@@ -612,6 +654,9 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 raise ValueError(f"Missing spine item in EPUB: {full}") from e
             raw = _decode_xhtml(raw_bytes)
             body_html = _extract_body_html(raw)
+            body_ids = BodyIdCollector()
+            body_ids.feed(raw)
+            body_ids.close()
             spine_items.append(
                 SpineItem(
                     index=spine_idx,
@@ -621,12 +666,16 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     stem=Path(rel).stem,
                     raw_html=raw,
                     body_html=body_html,
+                    body_fragments=tuple(body_ids.fragments),
+                    linear=linear,
                 )
             )
 
         file_anchor_map = {item.full_path: item.anchor for item in spine_items}
         fragment_anchor_map: dict[tuple[str, str], str] = {}
         for item in spine_items:
+            for fragment in item.body_fragments:
+                fragment_anchor_map[(item.full_path, fragment)] = item.anchor
             collector = FragmentIdCollector()
             collector.feed(item.body_html)
             collector.close()
@@ -688,30 +737,31 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 image_path_to_recindex=image_path_to_recindex,
             )
             clean = sanitizer.sanitize(item.body_html)
+            parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
             if clean:
-                fallback_toc.append((item.anchor, chapter_title, item.stem, item.index))
-                parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
+                if item.linear:
+                    fallback_toc.append((item.anchor, chapter_title, item.stem, item.index))
                 parts.append(clean)
                 parts.append("<mbp:pagebreak/>")
 
-        source_targets = nav_targets or ncx_targets
-        raw_toc: list[tuple[str, str, str, int]] = []
-        seen_anchors: set[str] = set()
-        for target in source_targets:
-            if target.fragment:
-                anchor = fragment_anchor_map.get((target.path, target.fragment))
-            else:
-                anchor = file_anchor_map.get(target.path)
-            if anchor is None or anchor in seen_anchors:
-                continue
-            spine_item = next((item for item in spine_items if item.full_path == target.path), None)
-            if spine_item is None:
-                continue
-            seen_anchors.add(anchor)
-            raw_toc.append((anchor, target.label, spine_item.stem, spine_item.index))
+        def resolve_toc_targets(targets: list[TocTarget]) -> list[tuple[str, str, str, int]]:
+            entries: list[tuple[str, str, str, int]] = []
+            seen_anchors: set[str] = set()
+            for target in targets:
+                anchor = (
+                    fragment_anchor_map.get((target.path, target.fragment))
+                    if target.fragment else file_anchor_map.get(target.path)
+                )
+                if anchor is None or anchor in seen_anchors:
+                    continue
+                spine_item = next((item for item in spine_items if item.full_path == target.path), None)
+                if spine_item is None:
+                    continue
+                seen_anchors.add(anchor)
+                entries.append((anchor, target.label, spine_item.stem, spine_item.index))
+            return entries
 
-        if not raw_toc:
-            raw_toc = fallback_toc
+        raw_toc = resolve_toc_targets(nav_targets) or resolve_toc_targets(ncx_targets) or fallback_toc
 
         label_counts: dict[str, int] = {}
         for _, label, _, _ in raw_toc:
@@ -842,7 +892,12 @@ class MinimalHtmlSanitizer(HTMLParser):
         if not self._table_stack or not self._table_stack[-1][0]:
             return
         _is_simple, start_idx = self._table_stack[-1]
-        del self.fed[start_idx:]
+        # Keep text and links already emitted by earlier cells when a later cell
+        # makes the table too complex to preserve as a table.
+        for idx in range(start_idx, len(self.fed)):
+            tag = self.fed[idx]
+            if re.fullmatch(r"</?(?:table|thead|tbody|tfoot|tr|td|th)(?:\s[^>]*)?>", tag):
+                self.fed[idx] = "\n" if tag.startswith(("<tr", "</tr")) else " "
         self._table_stack[-1] = (False, start_idx)
 
     def _inject_named_anchors(self, attrs) -> None:
@@ -1090,6 +1145,36 @@ class MobiWriter:
         toc_len = len(provisional_toc)
         return [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
 
+    @staticmethod
+    def _prepare_internal_links(body_bytes: bytes) -> tuple[bytes, list[bytes]]:
+        targets: list[bytes] = []
+
+        def replace(match: re.Match[bytes]) -> bytes:
+            anchor = match.group(2)
+            tag = b'<a name="' + anchor + b'" id="' + anchor + b'"></a>'
+            if tag not in body_bytes:
+                return match.group(1)
+            targets.append(anchor)
+            return match.group(1) + b' filepos="??????????"'
+
+        return re.sub(rb'(<a\b[^>]*?) href="#([^"]+)"', replace, body_bytes), targets
+
+    @staticmethod
+    def _finish_internal_links(body_bytes: bytes, body_start: int, targets: list[bytes]) -> bytes:
+        positions = {
+            anchor: body_bytes.find(b'<a name="' + anchor + b'" id="' + anchor + b'"></a>')
+            for anchor in targets
+        }
+        target_iter = iter(targets)
+
+        def replace(match: re.Match[bytes]) -> bytes:
+            filepos = body_start + positions[next(target_iter)]
+            if filepos >= TOC_FILEPOS_MAX:
+                raise ValueError(f"Internal link filepos out of range: {filepos}")
+            return match.group(1) + f' filepos="{filepos:0{TOC_FILEPOS_WIDTH}d}"'.encode("ascii")
+
+        return re.sub(rb'(<a\b[^>]*?) filepos="\?{10}"', replace, body_bytes)
+
     def _build_text_layout(self) -> TextLayout:
         html_prefix = (
             "<html><head>"
@@ -1099,7 +1184,9 @@ class MobiWriter:
         html_suffix = "</body></html>"
 
         prefix_bytes = _encode_mobi_text(html_prefix)
-        body_bytes = _encode_mobi_text(self.epub.html_content)
+        body_bytes, internal_targets = self._prepare_internal_links(
+            _encode_mobi_text(self.epub.html_content)
+        )
         guide_bytes = b""
         toc_bytes = b""
         toc_filepos = None
@@ -1114,6 +1201,9 @@ class MobiWriter:
             toc_entry_positions = tuple(final_positions)
             toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions))
 
+        body_bytes = self._finish_internal_links(
+            body_bytes, len(prefix_bytes) + len(guide_bytes) + len(toc_bytes), internal_targets
+        )
         suffix_bytes = _encode_mobi_text(html_suffix)
         return TextLayout(
             text_bytes=prefix_bytes + guide_bytes + toc_bytes + body_bytes + suffix_bytes,
@@ -1225,7 +1315,10 @@ class MobiWriter:
         secondary_record = secondary_header + bytes(entries_blob) + secondary_idxt
 
         tagx = self._build_tagx()
-        main_dummy = bytes((len(b"000"),)) + b"000"
+        last_name = f"{len(self.epub.toc_entries) - 1:03d}".encode("ascii")
+        main_dummy = bytes((len(last_name),)) + last_name
+        main_dummy += struct.pack(">H", len(self.epub.toc_entries))
+        main_dummy += b"\x00" * (-(INDX_HEADER_LEN + len(tagx) + len(main_dummy)) % 4)
         main_idxt = self._build_idxt([INDX_HEADER_LEN + len(tagx)])
         main_header = self._build_indx_header(
             indx_type=INDX_TYPE_INFLECTION,
@@ -1624,6 +1717,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     outfile = Path(args.output_mobi) if args.output_mobi else infile.with_suffix(".mobi")
 
     try:
+        if outfile.exists() and infile.samefile(outfile):
+            raise ValueError("Output path resolves to the input EPUB; choose a different output path")
         epub_data = parse_epub(infile)
         MobiWriter(epub_data).build(str(outfile))
 
