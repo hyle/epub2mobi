@@ -831,24 +831,40 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 parts.append(clean)
                 parts.append("<mbp:pagebreak/>")
 
-        def resolve_toc_targets(targets: list[TocTarget]) -> list[tuple[str, str, str, int]]:
+        def resolve_toc_targets(targets: list[TocTarget]) -> tuple[list[tuple[str, str, str, int]], bool]:
             entries: list[tuple[str, str, str, int]] = []
             seen_anchors: set[str] = set()
+            unresolved = False
             for target in targets:
                 anchor = (
                     fragment_anchor_map.get((target.path, target.fragment))
                     if target.fragment else file_anchor_map.get(target.path)
                 )
-                if anchor is None or anchor in seen_anchors:
+                if anchor is None:
+                    unresolved = True
+                    continue
+                if anchor in seen_anchors:
                     continue
                 spine_item = next((item for item in spine_items if item.full_path == target.path), None)
                 if spine_item is None:
+                    unresolved = True
                     continue
                 seen_anchors.add(anchor)
                 entries.append((anchor, target.label, spine_item.stem, spine_item.index))
-            return entries
+            return entries, unresolved
 
-        raw_toc = resolve_toc_targets(nav_targets) or resolve_toc_targets(ncx_targets) or fallback_toc
+        nav_toc, nav_incomplete = resolve_toc_targets(nav_targets)
+        ncx_toc, ncx_incomplete = resolve_toc_targets(ncx_targets)
+        # Keep a complete source TOC, even if it intentionally lists fewer chapters.
+        # Replace a partially broken TOC only when another source has more entries.
+        if nav_incomplete:
+            raw_toc = max((nav_toc, ncx_toc, fallback_toc), key=len)
+        elif nav_toc:
+            raw_toc = nav_toc
+        elif ncx_incomplete:
+            raw_toc = max((ncx_toc, fallback_toc), key=len)
+        else:
+            raw_toc = ncx_toc or fallback_toc
 
         label_counts: dict[str, int] = {}
         for _, label, _, _ in raw_toc:
@@ -1093,6 +1109,8 @@ class MinimalHtmlSanitizer(HTMLParser):
     def handle_endtag(self, tag):
         if tag in self._SUPPRESSED:
             self._suppressed_depth = max(0, self._suppressed_depth - 1)
+            return
+        if tag in {"br", "hr", "img", "mbp:pagebreak"}:
             return
 
         output_tag = self._output_tag_stack.pop() if self._output_tag_stack else None
@@ -1374,13 +1392,19 @@ class MobiWriter:
         entries_blob = bytearray()
         entry_positions = list(layout.toc_entry_positions)
         text_length = len(layout.text_bytes)
+        # Auxiliary spine items can put TOC order out of physical text order.
+        positions_in_text_order = sorted(set(entry_positions))
+        end_by_position = {
+            filepos: positions_in_text_order[index + 1]
+            if index + 1 < len(positions_in_text_order) else text_length
+            for index, filepos in enumerate(positions_in_text_order)
+        }
         for index, ((_, _title), filepos, label_offset) in enumerate(
             zip(self.epub.toc_entries, entry_positions, label_offsets)
         ):
             entry_offsets.append(INDX_HEADER_LEN + len(entries_blob))
             name = f"{index:03d}".encode("ascii")
-            next_filepos = entry_positions[index + 1] if index + 1 < len(entry_positions) else text_length
-            length = max(1, next_filepos - filepos)
+            length = max(1, end_by_position[filepos] - filepos)
 
             entries_blob.append(len(name))
             entries_blob.extend(name)
