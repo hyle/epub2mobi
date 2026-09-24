@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import html as htmlmod
 import logging
+import locale
 import os
 import posixpath
 import re
@@ -23,7 +24,6 @@ from xml.parsers import expat
 
 from dataclasses import dataclass
 from datetime import datetime
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -146,6 +146,7 @@ class EpubData:
     toc_entries: tuple[tuple[str, str], ...]
     image_records: tuple[bytes, ...] = ()
     omitted_media: tuple[MediaOmission, ...] = ()
+    language: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -155,8 +156,8 @@ class SpineItem:
     full_path: str
     anchor: str
     stem: str
-    raw_html: str
-    body_html: str
+    document: ET.Element
+    body: ET.Element
     body_fragments: tuple[str, ...]
     linear: bool
 
@@ -189,8 +190,40 @@ def _encode_mobi_text(s: str) -> bytes:
 
 
 def _encode_meta(s: str) -> bytes:
-    """Encode metadata same as content."""
+    """Encode metadata as CP1252, replacing unsupported characters."""
     return s.encode(MOBI_TEXT_ENCODING_PY, errors="replace")
+
+
+def _mobi_locale(language: Optional[str]) -> int:
+    """Map EPUB language tags to the Windows language IDs used by MOBI.
+
+    Missing/unknown languages use neutral (0). A known language with an
+    unmapped variant uses its primary ID without inventing a region/script.
+    """
+    if not language:
+        return 0
+    tag = language.strip().lower().replace("_", "-")
+    # Common ISO 639-2 aliases used by EPUB 2 producers.
+    aliases = {"eng": "en", "ita": "it", "fra": "fr", "fre": "fr",
+               "deu": "de", "ger": "de", "spa": "es", "por": "pt",
+               "nld": "nl", "dut": "nl", "zho": "zh", "chi": "zh",
+               "jpn": "ja", "rus": "ru"}
+    parts = tag.split("-")
+    parts[0] = aliases.get(parts[0], parts[0])
+    tag = "-".join(parts)
+    exact = {code for code, name in locale.windows_locale.items()
+             if name.lower().replace("_", "-") == tag}
+    if len(exact) == 1:
+        return exact.pop()
+    primary = {code & 0x3ff for code, name in locale.windows_locale.items()
+               if name.split("_")[0].lower() == parts[0]}
+    if len(primary) == 1:
+        code = primary.pop()
+        if len(parts) > 1:
+            logger.warning("Language variant '%s' has no unambiguous MOBI locale; using primary language", language)
+        return code
+    logger.warning("Unsupported language '%s'; using neutral MOBI locale", language)
+    return 0
 
 
 def _encode_index_text(s: str) -> bytes:
@@ -209,8 +242,8 @@ def _encode_vwi(value: int) -> bytes:
     return bytes(reversed(chunks))
 
 
-def _parse_xml(data: bytes, source_name: str) -> ET.Element:
-    if len(data) > MAX_XML_BYTES:
+def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None) -> ET.Element:
+    if len(data) > (MAX_XML_BYTES if size_limit is None else size_limit):
         raise ValueError(f"XML file too large: {source_name}")
     # Expat sees declarations regardless of whether the XML is UTF-8, UTF-16, or UTF-32.
     guard = expat.ParserCreate()
@@ -223,7 +256,7 @@ def _parse_xml(data: bytes, source_name: str) -> ET.Element:
     try:
         guard.Parse(data, True)
         return ET.fromstring(data)
-    except (ET.ParseError, expat.ExpatError) as e:
+    except (ET.ParseError, expat.ExpatError, LookupError, UnicodeError) as e:
         raise ValueError(f"Malformed XML: {source_name}") from e
 
 
@@ -251,26 +284,68 @@ def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
     return normalized_opf, posixpath.dirname(normalized_opf)
 
 
-def _extract_title(html_str: str) -> Optional[str]:
-    parser = SimpleTitleExtractor()
-    parser.feed(html_str)
-    parser.close()
-    heading = parser.heading.strip()
-    if heading:
-        return heading
-    title = parser.title.strip()
-    if title:
-        return title
+def _parse_xhtml(data: bytes, source_name: str) -> ET.Element:
+    root = _parse_xml(data, source_name, MAX_XHTML_BYTES)
+    # Normalize XHTML only; foreign vocabularies must not become HTML elements.
+    stack = [(root, 0)]
+    while stack:
+        elem, depth = stack.pop()
+        if depth > 256:
+            raise ValueError(f"XHTML nesting too deep: {source_name}")
+        if elem.tag.startswith("{http://www.w3.org/1999/xhtml}"):
+            elem.tag = _strip_ns(elem.tag)
+        stack.extend((child, depth + 1) for child in elem)
+    return root
+
+
+def _body_element(root: ET.Element) -> ET.Element:
+    if root.tag == "html":
+        body = root.find("body")
+        if body is None:
+            raise ValueError("XHTML document has no body")
+        return body
+    return root
+
+
+def _visible_elements(root: ET.Element):
+    if root.tag in {"script", "style", "head"}:
+        return
+    yield root
+    for child in root:
+        yield from _visible_elements(child)
+
+
+def _visible_text(root: ET.Element, block_separators: bool = False) -> str:
+    if root.tag in {"script", "style", "head"}:
+        return ""
+    text = (root.text or "") + "".join(
+        _visible_text(child, block_separators) + (child.tail or "") for child in root
+    )
+    return f" {text} " if block_separators and root.tag in MinimalHtmlSanitizer._BLOCKS else text
+
+
+def _fragment_ids(root: ET.Element) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        value for elem in _visible_elements(root)
+        for key, value in elem.attrib.items() if key in {"id", "name"} and value
+    ))
+
+
+def _extract_title(root: ET.Element) -> Optional[str]:
+    for tags, elements in (({"h1", "h2"}, _visible_elements(_body_element(root))),
+                           ({"title"}, root.iter())):
+        for elem in elements:
+            if elem.tag in tags:
+                title = " ".join(_visible_text(elem).split())
+                if title:
+                    return title
     return None
 
 
-def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -> Optional[str]:
-    candidate = _extract_body_html(html_str)
-
-    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", candidate)
-    text = re.sub(r"(?is)<[^>]+>", " ", text)
-    text = htmlmod.unescape(text)
-    text = " ".join(text.split())
+def _extract_body_snippet(root: ET.Element, book_title: str, max_words: int = 10) -> Optional[str]:
+    # Preserve boundaries between blocks while joining inline text (including drop caps).
+    body = _body_element(root)
+    text = " ".join(_visible_text(body, block_separators=True).split())
     if not text:
         return None
 
@@ -285,7 +360,6 @@ def _extract_body_snippet(html_str: str, book_title: str, max_words: int = 10) -
     snippet = " ".join(words[:max_words])
     if len(words) > max_words:
         snippet += "..."
-    snippet = re.sub(r"^([A-Z]) (?=[a-z])", r"\1", snippet)
     return snippet or None
 
 
@@ -302,23 +376,6 @@ def _resolve_manifest_path(base_dir: str, href: str) -> str:
 
 def _is_supported_image_media_type(media_type: str) -> bool:
     return media_type.lower() in {"image/jpeg", "image/png", "image/gif"}
-
-
-def _extract_body_html(html_str: str) -> str:
-    lower = html_str.lower()
-    body_open = lower.find("<body")
-    if body_open != -1:
-        body_tag_end = html_str.find(">", body_open)
-        start = body_tag_end + 1 if body_tag_end != -1 else body_open
-        body_close = lower.rfind("</body>")
-        if body_close != -1 and body_close > start:
-            return html_str[start:body_close]
-        return html_str[start:]
-
-    head_close = lower.find("</head>")
-    if head_close != -1:
-        return html_str[head_close + len("</head>") :]
-    return html_str
 
 
 def _resolve_book_href(current_path: str, href: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -345,63 +402,23 @@ def _reported_media_path(current_path: str, href: Optional[str], fallback: str) 
     return resolved[0] if resolved else href
 
 
-class FragmentIdCollector(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.fragments: list[str] = []
-        self._seen: set[str] = set()
-
-    def handle_starttag(self, tag, attrs):
-        for key, value in attrs:
-            if key in {"id", "name"} and value and value not in self._seen:
-                self.fragments.append(value)
-                self._seen.add(value)
-
-
-class BodyIdCollector(FragmentIdCollector):
-    def handle_starttag(self, tag, attrs):
-        if tag == "body":
-            super().handle_starttag(tag, attrs)
-
-
-class MediaRefCollector(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.image_sources: list[Optional[str]] = []
-        self.unsupported: list[tuple[str, Optional[str]]] = []
-        self.inline_svg = False
-        self._media_stack: list[tuple[str, bool]] = []
-
-    def handle_starttag(self, tag, attrs):
-        attributes = dict(attrs)
+def _media_references(body: ET.Element):
+    images = []
+    unsupported = []
+    inline_svg = False
+    for elem in _visible_elements(body):
+        tag = elem.tag
         if tag == "img":
-            self.image_sources.append(attributes.get("src"))
-        elif tag == "svg":
-            self.inline_svg = True
+            images.append(elem.get("src"))
+        elif tag in {"svg", "{http://www.w3.org/2000/svg}svg"}:
+            inline_svg = True
         elif tag in {"audio", "video"}:
-            src = attributes.get("src")
-            self._media_stack.append((tag, bool(src)))
-            if src:
-                self.unsupported.append((tag, src))
-        elif tag == "source" and self._media_stack:
-            src = attributes.get("src")
-            if src:
-                kind, _ = self._media_stack[-1]
-                self.unsupported.append((kind, src))
-                self._media_stack[-1] = (kind, True)
+            sources = [elem.get("src")] if elem.get("src") else []
+            sources.extend(child.get("src") for child in elem if child.tag == "source" and child.get("src"))
+            unsupported.extend((tag, src) for src in (sources or [None]))
         elif tag in {"object", "embed"}:
-            self.unsupported.append((tag, attributes.get("data" if tag == "object" else "src")))
-
-    def handle_endtag(self, tag):
-        if tag in {"audio", "video"} and self._media_stack:
-            kind, has_source = self._media_stack.pop()
-            if not has_source:
-                self.unsupported.append((kind, None))
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
-        if tag in {"audio", "video"}:
-            self.handle_endtag(tag)
+            unsupported.append((tag, elem.get("data" if tag == "object" else "src")))
+    return images, unsupported, inline_svg
 
 
 def _extract_nav_toc_targets(
@@ -421,16 +438,17 @@ def _extract_nav_toc_targets(
     if not nav_href:
         return []
 
-    nav_path = _resolve_manifest_path(base_dir, nav_href)
+    nav_path = nav_href
     try:
-        nav_root = _parse_xml(_read_xml_member(z, nav_path), nav_path)
+        nav_path = _resolve_manifest_path(base_dir, nav_href)
+        nav_root = _parse_xhtml(_read_xml_member(z, nav_path), nav_path)
     except (KeyError, ValueError):
         logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
         return []
 
     toc_nav = None
     for elem in nav_root.iter():
-        if not elem.tag.endswith("nav"):
+        if elem.tag != "nav":
             continue
         nav_type = ""
         for key, value in elem.attrib.items():
@@ -446,7 +464,7 @@ def _extract_nav_toc_targets(
 
     toc_targets: list[TocTarget] = []
     for elem in toc_nav.iter():
-        if not elem.tag.endswith("a"):
+        if elem.tag != "a":
             continue
         raw_href = elem.attrib.get("href")
         if not raw_href:
@@ -482,8 +500,9 @@ def _build_ncx_label_map(
     if not ncx_href:
         return []
 
-    ncx_path = _resolve_manifest_path(base_dir, ncx_href)
+    ncx_path = ncx_href
     try:
+        ncx_path = _resolve_manifest_path(base_dir, ncx_href)
         ncx_root = _parse_xml(_read_xml_member(z, ncx_path), ncx_path)
     except (KeyError, ValueError):
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
@@ -567,24 +586,6 @@ def _read_xml_member(z: zipfile.ZipFile, member_path: str) -> bytes:
     return data
 
 
-def _decode_xhtml(data: bytes) -> str:
-    if data.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")):
-        return data.decode("utf-32", errors="replace")
-    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return data.decode("utf-16", errors="replace")
-    if data.startswith(b"\xef\xbb\xbf"):
-        return data.decode("utf-8-sig", errors="replace")
-
-    head = data[:1024].decode("ascii", errors="ignore")
-    match = re.search(r"""encoding=["']([A-Za-z0-9._-]+)["']""", head, flags=re.IGNORECASE)
-    encoding = match.group(1) if match else "utf-8"
-    try:
-        return data.decode(encoding, errors="replace")
-    except LookupError:
-        logger.warning("Unknown XHTML encoding '%s'; falling back to utf-8", encoding)
-        return data.decode("utf-8", errors="replace")
-
-
 def parse_epub(filepath: Union[str, Path]) -> EpubData:
     filepath = Path(filepath)
     if not filepath.exists():
@@ -593,6 +594,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
     book_title = "Unknown"
     book_author = "Unknown"
     book_uuid = "000000000000"
+    book_language = None
 
     with zipfile.ZipFile(filepath, "r") as z:
         opf_path, base_dir = _find_opf(z)
@@ -612,6 +614,8 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 book_title = elem.text.strip() or book_title
             elif t == "creator" and elem.text:
                 book_author = elem.text.strip() or book_author
+            elif elem.tag == "{http://purl.org/dc/elements/1.1/}language" and elem.text and not book_language:
+                book_language = elem.text.strip() or None
             elif t == "identifier" and elem.text:
                 ident = elem.text.strip()
                 if ident and not fallback_uuid:
@@ -649,6 +653,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         manifest_paths = {
             _resolve_manifest_path(base_dir, href): iid
             for iid, href in manifest.items()
+            if _resolve_book_href(opf_path, href) is not None
         }
 
         omissions: list[MediaOmission] = []
@@ -672,7 +677,12 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 or media_type in font_media_types
                 or resource_path.endswith((".ttf", ".otf", ".woff", ".woff2"))
             )
-            if is_font:
+            if _resolve_book_href(opf_path, href) is None:
+                record_omission(
+                    _reported_media_path(opf_path, href, href), opf_path,
+                    "remote or data URI manifest resource is not embedded",
+                )
+            elif is_font:
                 record_omission(
                     _resolve_manifest_path(base_dir, href), opf_path,
                     "declared font is not embedded",
@@ -711,6 +721,8 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             rel = manifest.get(item_id)
             if not rel:
                 raise ValueError(f"Malformed OPF: spine item '{item_id}' is missing from manifest")
+            if _resolve_book_href(opf_path, rel) is None:
+                raise ValueError(f"Remote spine content is not supported: {rel}")
             full = _resolve_manifest_path(base_dir, rel)
             if manifest_media_types.get(item_id, "").lower() == "image/svg+xml":
                 svg_spine_paths.add(full)
@@ -726,11 +738,11 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 )
             except KeyError as e:
                 raise ValueError(f"Missing spine item in EPUB: {full}") from e
-            raw = _decode_xhtml(raw_bytes)
-            body_html = _extract_body_html(raw)
-            body_ids = BodyIdCollector()
-            body_ids.feed(raw)
-            body_ids.close()
+            document = _parse_xhtml(raw_bytes, full)
+            try:
+                body = _body_element(document)
+            except ValueError as e:
+                raise ValueError(f"Invalid XHTML: {full}: {e}") from e
             spine_items.append(
                 SpineItem(
                     index=spine_idx,
@@ -738,9 +750,9 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     full_path=full,
                     anchor=f"spine_{spine_idx}",
                     stem=Path(rel).stem,
-                    raw_html=raw,
-                    body_html=body_html,
-                    body_fragments=tuple(body_ids.fragments),
+                    document=document,
+                    body=body,
+                    body_fragments=tuple(body.get(key) for key in ("id", "name") if body.get(key)) if body.tag == "body" else (),
                     linear=linear,
                 )
             )
@@ -750,25 +762,23 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         for item in spine_items:
             for fragment in item.body_fragments:
                 fragment_anchor_map[(item.full_path, fragment)] = item.anchor
-            collector = FragmentIdCollector()
-            collector.feed(item.body_html)
-            collector.close()
-            for fragment_idx, fragment in enumerate(collector.fragments, start=1):
+            fragments = _fragment_ids(item.body)
+            for fragment_idx, fragment in enumerate(fragments, start=1):
+                if fragment in item.body_fragments:
+                    continue
                 fragment_anchor_map[(item.full_path, fragment)] = f"{item.anchor}_frag_{fragment_idx}"
 
         image_path_to_recindex: dict[str, int] = {}
         image_records: list[bytes] = []
         for item in spine_items:
-            collector = MediaRefCollector()
-            collector.feed(item.body_html)
-            collector.close()
-            if collector.inline_svg and item.full_path not in svg_spine_paths:
+            image_sources, unsupported, inline_svg = _media_references(item.body)
+            if inline_svg and item.full_path not in svg_spine_paths:
                 record_omission("<inline SVG>", item.full_path, "inline SVG is not rendered")
-            for kind, raw_src in collector.unsupported:
+            for kind, raw_src in unsupported:
                 resource = _reported_media_path(item.full_path, raw_src, f"<{kind}>")
                 record_omission(resource, item.full_path, f"{kind} is not supported")
 
-            for raw_src in collector.image_sources:
+            for raw_src in image_sources:
                 if not raw_src:
                     record_omission("<img without src>", item.full_path, "image has no source")
                     continue
@@ -807,14 +817,14 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         fallback_toc: list[tuple[str, str, str, int]] = []
         for item in spine_items:
             ncx_title = next((target.label for target in ncx_targets if target.path == item.full_path and target.fragment is None), None)
-            guessed_title = _extract_title(item.raw_html)
+            guessed_title = _extract_title(item.document)
             chapter_title = ncx_title or guessed_title
             if (
                 not chapter_title
                 or chapter_title.strip().lower() in ("unknown", "untitled")
                 or chapter_title.strip().lower() == book_title.strip().lower()
             ):
-                body_snippet = _extract_body_snippet(item.raw_html, book_title)
+                body_snippet = _extract_body_snippet(item.document, book_title)
                 chapter_title = body_snippet or chapter_title or item.stem or item.anchor
 
             sanitizer = MinimalHtmlSanitizer(
@@ -823,7 +833,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 fragment_anchor_map=fragment_anchor_map,
                 image_path_to_recindex=image_path_to_recindex,
             )
-            clean = sanitizer.sanitize(item.body_html)
+            clean = sanitizer.sanitize(item.body)
             parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
             if clean:
                 if item.linear:
@@ -893,10 +903,11 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             toc_entries=tuple(toc_entries),
             image_records=tuple(image_records),
             omitted_media=tuple(omissions),
+            language=book_language,
         )
 
 
-class MinimalHtmlSanitizer(HTMLParser):
+class MinimalHtmlSanitizer:
     _BLOCKS: frozenset[str] = frozenset(
         {
             "p",
@@ -928,7 +939,7 @@ class MinimalHtmlSanitizer(HTMLParser):
     )
     _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
 
-    _SUPPRESSED: frozenset[str] = frozenset({"script", "style"})
+    _SUPPRESSED: frozenset[str] = frozenset({"script", "style", "head"})
     _HEADING_HINTS: frozenset[str] = frozenset({"chapter-title", "chap-title", "heading", "chapterhead", "chapter-heading"})
     _CENTER_HINTS: frozenset[str] = frozenset({"center", "centre", "centered", "centred", "epigraph", "ornament", "separator", "scene-break", "scenebreak", "asterism", "dinkus"})
     _RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "credit", "byline", "source"})
@@ -940,25 +951,17 @@ class MinimalHtmlSanitizer(HTMLParser):
         fragment_anchor_map: dict[tuple[str, str], str],
         image_path_to_recindex: dict[str, int],
     ):
-        super().__init__(convert_charrefs=True)
         self.current_path = current_path
         self.file_anchor_map = file_anchor_map
         self.fragment_anchor_map = fragment_anchor_map
         self.image_path_to_recindex = image_path_to_recindex
         self.fed: list[str] = []
-        self._suppressed_depth = 0
-        self._table_stack: list[tuple[bool, int]] = []
-        self._output_tag_stack: list[Optional[str]] = []
 
     def _ensure_block_sep(self) -> None:
         if self.fed:
             last = self.fed[-1]
             if last and last[-1] != "\n":
                 self.fed.append("\n")
-
-    @staticmethod
-    def _attr_map(attrs) -> dict[str, str]:
-        return {k.lower(): (v or "") for k, v in attrs}
 
     @staticmethod
     def _tokenize_hints(*values: str) -> set[str]:
@@ -979,30 +982,6 @@ class MinimalHtmlSanitizer(HTMLParser):
         if hint_tokens & MinimalHtmlSanitizer._RIGHT_HINTS:
             return "right"
         return None
-
-    def _table_is_simple(self, tag: str, attr_map: dict[str, str]) -> bool:
-        if tag == "table" and self._table_stack:
-            return False
-        for key in ("rowspan", "colspan"):
-            value = attr_map.get(key, "").strip()
-            if value and value not in {"1", ""}:
-                return False
-        return True
-
-    def _in_simple_table(self) -> bool:
-        return bool(self._table_stack and self._table_stack[-1][0])
-
-    def _mark_current_table_complex(self) -> None:
-        if not self._table_stack or not self._table_stack[-1][0]:
-            return
-        _is_simple, start_idx = self._table_stack[-1]
-        # Keep text and links already emitted by earlier cells when a later cell
-        # makes the table too complex to preserve as a table.
-        for idx in range(start_idx, len(self.fed)):
-            tag = self.fed[idx]
-            if re.fullmatch(r"</?(?:table|thead|tbody|tfoot|tr|td|th)(?:\s[^>]*)?>", tag):
-                self.fed[idx] = "\n" if tag.startswith(("<tr", "</tr")) else " "
-        self._table_stack[-1] = (False, start_idx)
 
     def _inject_named_anchors(self, attrs) -> None:
         seen: set[str] = set()
@@ -1030,170 +1009,68 @@ class MinimalHtmlSanitizer(HTMLParser):
             return f"#{fallback}"
         return None
 
-    def sanitize(self, html_str: str) -> str:
+    def sanitize(self, body: ET.Element) -> str:
         self.fed = []
-        self._suppressed_depth = 0
-        self._table_stack = []
-        self._output_tag_stack = []
-        self.reset()
-        self.feed(html_str)
-        self.close()
+        self._emit(body)
         return "".join(self.fed)
 
-    def handle_starttag(self, tag, attrs):
+    def _emit(self, elem: ET.Element, flatten_table: bool = False) -> None:
+        tag = elem.tag
         if tag in self._SUPPRESSED:
-            self._suppressed_depth += 1
             return
-
-        self._inject_named_anchors(attrs)
-        attr_map = self._attr_map(attrs)
-        hint_tokens = self._tokenize_hints(attr_map.get("class", ""), attr_map.get("id", ""))
-        effective_tag = tag
-
-        if tag in {"p", "div"} and hint_tokens & self._HEADING_HINTS:
-            effective_tag = "h2"
-
+        attrs = elem.attrib
+        if tag != "body":
+            self._inject_named_anchors(attrs.items())
         if tag == "table":
-            if self._table_stack:
-                self._mark_current_table_complex()
-            self._table_stack.append((self._table_is_simple(tag, attr_map), len(self.fed)))
-        elif tag in {"td", "th"} and not self._table_is_simple(tag, attr_map) and self._table_stack:
-            self._mark_current_table_complex()
-        elif tag in {"thead", "tbody", "tfoot", "tr", "td", "th"} and self._table_stack and not self._table_stack[-1][0]:
-            pass
-
-        if tag in self._ALLOWED:
-            if tag in {"thead", "tbody", "tfoot", "tr", "td", "th", "table"} and self._table_stack and not self._table_stack[-1][0]:
-                if tag in {"td", "th"}:
-                    self.fed.append(" ")
-                if tag not in {"br", "mbp:pagebreak", "hr", "img"}:
-                    self._output_tag_stack.append(None)
-                return
-            if tag in ("br", "mbp:pagebreak", "hr"):
-                self.fed.append(f"<{tag}/>")
-                return
-            if tag == "img":
-                src = attr_map.get("src", "")
-                resolved = _resolve_book_href(self.current_path, src) if src else None
-                recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
-                if recindex is not None:
-                    self.fed.append(f'<img recindex="{recindex}"/>')
-                return
-
-            # Reconstruct the tag
+            flatten_table = flatten_table or any(
+                (child is not elem and child.tag == "table")
+                or any(child.get(key, "1").strip() not in {"", "1"}
+                       for key in ("rowspan", "colspan"))
+                for child in elem.iter()
+            )
+        table_tag = tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
+        output_tag = tag if tag in self._ALLOWED and not (flatten_table and table_tag) else None
+        hints = self._tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
+        if output_tag in {"p", "div"} and hints & self._HEADING_HINTS:
+            output_tag = "h2"
+        output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
+        if tag == "img":
+            src = attrs.get("src", "")
+            resolved = _resolve_book_href(self.current_path, src) if src else None
+            recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
+            if recindex is not None:
+                self.fed.append(f'<img recindex="{recindex}"/>')
+            return
+        if output_tag in {"br", "hr", "mbp:pagebreak"}:
+            self.fed.append(f"<{output_tag}/>")
+            return
+        if output_tag:
             attr_str = ""
-            # Only keep 'href' for anchors, ignore classes/styles as legacy MOBI ignores them mostly
-            if effective_tag == "a":
-                for k, v in attrs:
-                    if k == "href":
-                        rewritten = self._rewrite_href(v)
-                        if rewritten:
-                            attr_str = f' href="{htmlmod.escape(rewritten, quote=True)}"'
-                        break
-            elif effective_tag in self._BLOCKS:
-                align = self._derive_alignment(attr_map.get("style", ""), hint_tokens)
+            if output_tag == "a" and attrs.get("href"):
+                href = self._rewrite_href(attrs["href"])
+                if href:
+                    attr_str = f' href="{htmlmod.escape(href, quote=True)}"'
+            elif output_tag in self._BLOCKS:
+                align = self._derive_alignment(attrs.get("style", ""), hints)
                 if align:
                     attr_str = f' align="{align}"'
-
-            # Map modern semantics to legacy
-            if effective_tag == "strong": effective_tag = "b"
-            if effective_tag == "em": effective_tag = "i"
-
-            if effective_tag in self._BLOCKS:
+            if output_tag in self._BLOCKS:
                 self._ensure_block_sep()
-            self.fed.append(f"<{effective_tag}{attr_str}>")
-            self._output_tag_stack.append(effective_tag)
-        elif tag not in {"br", "mbp:pagebreak", "hr", "img"}:
-            self._output_tag_stack.append(None)
-
-    def handle_endtag(self, tag):
-        if tag in self._SUPPRESSED:
-            self._suppressed_depth = max(0, self._suppressed_depth - 1)
-            return
-        if tag in {"br", "hr", "img", "mbp:pagebreak"}:
-            return
-
-        output_tag = self._output_tag_stack.pop() if self._output_tag_stack else None
-
-        if tag == "table" and self._table_stack:
-            is_simple, _start_idx = self._table_stack.pop()
-            if not is_simple:
-                self.fed.append("\n")
-                return
-        elif tag in {"thead", "tbody", "tfoot", "tr", "td", "th"} and self._table_stack and not self._table_stack[-1][0]:
-            if tag == "tr":
-                self.fed.append("\n")
-            elif tag in {"td", "th"}:
-                self.fed.append(" ")
-            return
-
-        # Map modern semantics to legacy
-        if output_tag is None:
-            return
-        if output_tag in {"hr", "img"}:
-            return
-
-        if output_tag in self._ALLOWED and output_tag not in ("br", "mbp:pagebreak"):
+            self.fed.append(f"<{output_tag}{attr_str}>")
+        elif table_tag:
+            self.fed.append(" ")
+        if elem.text:
+            self.fed.append(htmlmod.escape(elem.text, quote=False))
+        for child in elem:
+            self._emit(child, flatten_table)
+            if child.tail:
+                self.fed.append(htmlmod.escape(child.tail, quote=False))
+        if output_tag:
             self.fed.append(f"</{output_tag}>")
-
-            # Legacy Kindle sometimes merges block elements if there isn't a newline
             if output_tag in self._BLOCKS:
                 self.fed.append("\n")
-
-    def handle_startendtag(self, tag, attrs):
-        if tag in self._SUPPRESSED:
-            return
-
-        self._inject_named_anchors(attrs)
-        if tag in self._ALLOWED:
-            if tag == "br":
-                self.fed.append("<br/>")
-            elif tag == "hr":
-                self.fed.append("<hr/>")
-            elif tag == "img":
-                attr_map = self._attr_map(attrs)
-                src = attr_map.get("src", "")
-                resolved = _resolve_book_href(self.current_path, src) if src else None
-                recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
-                if recindex is not None:
-                    self.fed.append(f'<img recindex="{recindex}"/>')
-            elif tag == "mbp:pagebreak":
-                self.fed.append("<mbp:pagebreak/>")
-
-    def handle_data(self, data):
-        if self._suppressed_depth:
-            return
-        # Escape content to ensure XML validity
-        self.fed.append(htmlmod.escape(data, quote=False))
-
-
-class SimpleTitleExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self._in_title = False
-        self._in_heading = False
-        self.title = ""
-        self.heading = ""
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "title":
-            self._in_title = True
-        elif tag in ("h1", "h2") and not self.heading:
-            self._in_heading = True
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag == "title":
-            self._in_title = False
-        elif tag in ("h1", "h2"):
-            self._in_heading = False
-
-    def handle_data(self, data):
-        if self._in_title:
-            self.title += data
-        elif self._in_heading:
-            self.heading += data
+        elif table_tag:
+            self.fed.append("\n" if tag in {"tr", "table"} else " ")
 
 
 class MobiWriter:
@@ -1623,7 +1500,7 @@ class MobiWriter:
         struct.pack_into(">I", mobi, OFF_UID, _crc32_u32(self.epub.uuid))
         struct.pack_into(">I", mobi, OFF_VERSION, 6)
         struct.pack_into(">I", mobi, OFF_MIN_VER, 6)
-        struct.pack_into(">I", mobi, OFF_LOCALE, 1033)
+        struct.pack_into(">I", mobi, OFF_LOCALE, _mobi_locale(self.epub.language))
 
         # Initialize absent pointers
         for off in (
@@ -1720,6 +1597,16 @@ class MobiWriter:
         return bytes(pdb), bytes(rec_info)
 
     def build(self, output_file: str) -> None:
+        for field_name, value in (("Title", self.epub.title), ("Author", self.epub.author)):
+            try:
+                value.encode(MOBI_TEXT_ENCODING_PY)
+            except UnicodeEncodeError:
+                logger.warning(
+                    "%s contains characters outside %s; MOBI metadata will replace them with '?'",
+                    field_name,
+                    HTML_META_CHARSET,
+                )
+
         layout = self._build_text_layout()
         nav_records = self._build_navigation_records(layout)
         text_bytes = layout.text_bytes
