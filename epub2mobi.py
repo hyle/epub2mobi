@@ -18,7 +18,10 @@ import sys
 import urllib.parse
 import zipfile
 import zlib
-# Note: Standard ET is not secure against maliciously constructed XML data
+# ElementTree is used to keep the converter dependency-free.
+# Untrusted XML is size-limited and pre-screened for unsafe declarations in
+# _parse_xml(). Applications requiring a hardened external parser may use
+# defusedxml.ElementTree instead.
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
