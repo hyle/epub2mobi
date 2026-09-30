@@ -2,7 +2,26 @@
 
 `epub2mobi.py` is a zero-dependency Python tool that converts EPUB files to legacy MOBI6 for older Kindle devices.
 
-It writes PalmDB/MOBI structures directly with the standard library and focuses on robust, text-first output.
+
+## Requirements
+
+- Python 3.9+
+
+
+## CLI Usage
+
+Convert:
+
+```bash
+python3 epub2mobi.py my_book.epub
+```
+
+Convert and deploy to a connected Kindle:
+
+```bash
+python3 epub2mobi.py my_book.epub --deploy
+```
+
 
 ## Features
 
@@ -23,19 +42,8 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 - Legacy-compatible body sanitization.
 - Optional USB deploy to Kindle `documents` folder (`--deploy`).
 
-## Requirements
 
-- Python 3.9+
-
-The test suite is verified on Python 3.9.6. Newer versions have not been tested here.
-
-## CLI Usage
-
-Convert:
-
-```bash
-python3 epub2mobi.py my_book.epub
-```
+## Advanced CLI Usage
 
 Choose an output path with `-o` or `--output`:
 
@@ -53,11 +61,6 @@ python3 epub2mobi.py my_book.epub --report-omissions
 
 The report covers referenced images, inline SVG, audio/video, embedded objects in spine content, fonts declared in the manifest, and remote manifest resources. Remote resources are not downloaded; local text conversion continues. The converter shows a one-line warning when it detects omissions even without the option.
 
-Convert and deploy to a connected Kindle:
-
-```bash
-python3 epub2mobi.py my_book.epub --deploy
-```
 
 ## Scope and Limitations
 
@@ -73,7 +76,6 @@ python3 epub2mobi.py my_book.epub --deploy
 - The first nonempty `dc:language` sets the MOBI locale. Recognized regional tags retain their region; unmapped variants fall back to the primary language with a warning. Missing or unknown languages use a neutral locale (unknown languages produce a warning).
 - XML guardrails reject entity declarations across supported encodings and limit ZIP members before reading them.
 
-Run the tests with `python3 -m unittest discover -s tests`.
 
 ## License
 
