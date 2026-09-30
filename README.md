@@ -13,6 +13,9 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 - Fragment-level TOC extraction when valid in-spine targets exist.
 - TOC labels prioritized from EPUB nav/NCX labels, then headings/titles, then body snippets/fallbacks.
 - Internal EPUB links, including links to body IDs, are converted to MOBI byte-position links.
+- Relative links and media honor the first XHTML `base` element with an `href`.
+- Foreign spine resources use readable XHTML manifest fallbacks; fallback cycles and missing targets are rejected.
+- Shared fallback documents retain distinct anchors and self-links for each spine occurrence. Links from other documents to the shared fallback path target its first occurrence.
 - Supported EPUB raster images (`jpeg`, `png`, `gif`) are emitted as MOBI resources when referenced from spine content.
 - Omitted media are counted in a warning; `--report-omissions` lists affected resources, source documents, and reasons.
 - Limited layout preservation for common book patterns such as centered headings, right-aligned attributions, scene breaks, and simple tables.
@@ -23,6 +26,8 @@ It writes PalmDB/MOBI structures directly with the standard library and focuses 
 ## Requirements
 
 - Python 3.9+
+
+The test suite is verified on Python 3.9.6. Newer versions have not been tested here.
 
 ## CLI Usage
 
@@ -40,19 +45,19 @@ python3 epub2mobi.py my_book.epub -o converted.mobi
 
 The output path cannot resolve to the input EPUB.
 
-Convert and deploy to a connected Kindle:
-
-```bash
-python3 epub2mobi.py my_book.epub --deploy
-```
-
 To see which media were omitted:
 
 ```bash
 python3 epub2mobi.py my_book.epub --report-omissions
 ```
 
-The report covers referenced images, inline SVG, audio/video, embedded objects in spine content, and fonts declared in the manifest. The converter shows a one-line warning when it detects omissions even without the option.
+The report covers referenced images, inline SVG, audio/video, embedded objects in spine content, fonts declared in the manifest, and remote manifest resources. Remote resources are not downloaded; local text conversion continues. The converter shows a one-line warning when it detects omissions even without the option.
+
+Convert and deploy to a connected Kindle:
+
+```bash
+python3 epub2mobi.py my_book.epub --deploy
+```
 
 ## Scope and Limitations
 
@@ -62,8 +67,13 @@ The report covers referenced images, inline SVG, audio/video, embedded objects i
 - Tables are preserved only when they are simple rectangular structures; complex tables are flattened while retaining their text.
 - Unsupported or missing images are skipped without failing the conversion.
 - The omission report does not inspect CSS background images or other visual effects defined only in stylesheets.
-- XHTML decoding supports BOMs and declared encodings, with fallback behavior for unknown encodings.
+- XHTML is parsed as XML, preserving namespaces, CDATA, and empty elements. Standard XHTML character entities in documents declaring an external DTD are resolved locally in both text and attributes without downloading the DTD. Unknown entities, malformed XHTML, custom entity declarations, and excessive nesting are rejected.
+- Flattened block elements preserve text boundaries. Omitted SVG subtrees contribute no text, styles, scripts, images, or fragment destinations.
+- MOBI output uses Windows-1252; conversion warns when title or author characters cannot be represented and will be replaced in metadata.
+- The first nonempty `dc:language` sets the MOBI locale. Recognized regional tags retain their region; unmapped variants fall back to the primary language with a warning. Missing or unknown languages use a neutral locale (unknown languages produce a warning).
 - XML guardrails reject entity declarations across supported encodings and limit ZIP members before reading them.
+
+Run the tests with `python3 -m unittest discover -s tests`.
 
 ## License
 
