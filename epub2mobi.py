@@ -27,6 +27,7 @@ from xml.parsers import expat
 
 from dataclasses import dataclass
 from datetime import datetime
+from html.entities import name2codepoint
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
@@ -157,11 +158,14 @@ class SpineItem:
     index: int
     href: str
     full_path: str
+    aliases: tuple[str, ...]
+    base_url: str
     anchor: str
     stem: str
     document: ET.Element
     body: ET.Element
     body_fragments: tuple[str, ...]
+    fragment_anchors: dict[str, str]
     linear: bool
 
 
@@ -245,7 +249,8 @@ def _encode_vwi(value: int) -> bytes:
     return bytes(reversed(chunks))
 
 
-def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None) -> ET.Element:
+def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
+               *, xhtml_entities: bool = False) -> ET.Element:
     if len(data) > (MAX_XML_BYTES if size_limit is None else size_limit):
         raise ValueError(f"XML file too large: {source_name}")
     # Expat sees declarations regardless of whether the XML is UTF-8, UTF-16, or UTF-32.
@@ -256,8 +261,73 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None) 
 
     guard.EntityDeclHandler = reject_entity
     guard.ExternalEntityRefHandler = reject_entity
+    encoding = None
+    doctype_start = None
+    doctype_end = None
+    doctype_name = None
+    external_doctype = False
+    subset_start = None
+    subset_end = None
+    in_prolog = True
+
+    def start_element(_name, _attributes):
+        nonlocal in_prolog
+        in_prolog = False
+
+    def xml_declaration(_version, declared_encoding, _standalone):
+        nonlocal encoding
+        encoding = declared_encoding
+
+    def declaration_token(token):
+        nonlocal doctype_start, doctype_name, external_doctype, subset_start, subset_end
+        if not in_prolog:
+            return
+        if token == "<!DOCTYPE" and doctype_start is None:
+            doctype_start = guard.CurrentByteIndex
+        elif doctype_start is not None and doctype_end is None:
+            if doctype_name is None and token.strip():
+                doctype_name = token
+            elif token in {"SYSTEM", "PUBLIC"} and subset_start is None:
+                external_doctype = True
+            elif token == "[" and subset_start is None:
+                subset_start = guard.CurrentByteIndex
+            elif token == "]":
+                subset_end = guard.CurrentByteIndex
+
+    def end_doctype():
+        nonlocal doctype_end
+        doctype_end = guard.CurrentByteIndex
+
+    guard.XmlDeclHandler = xml_declaration
+    guard.StartElementHandler = start_element
+    guard.DefaultHandler = declaration_token
+    guard.EndDoctypeDeclHandler = end_doctype
     try:
         guard.Parse(data, True)
+        if xhtml_entities and external_doctype:
+            # XMLParser.entity does not expand entities in attributes. Replace
+            # the external subset with trusted local declarations, after the
+            # guard has rejected all source entity declarations. Removing the
+            # external identifier also prevents unknown attribute entities from
+            # being silently skipped. No external resource is read.
+            if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+                encoding = "utf-16"
+            elif encoding is None:
+                encoding = ("utf-16-le" if data.startswith(b"<\x00") else
+                            "utf-16-be" if data.startswith(b"\x00<") else "utf-8")
+            text = data.decode(encoding)
+            start = len(data[:doctype_start].decode(encoding))
+            end = len(data[:doctype_end].decode(encoding)) + 1
+            subset = ""
+            if subset_start is not None and subset_end is not None:
+                left = len(data[:subset_start].decode(encoding)) + 1
+                right = len(data[:subset_end].decode(encoding))
+                subset = text[left:right]
+            declarations = "".join(f'<!ENTITY {name} "&#{code};">'
+                                   for name, code in name2codepoint.items()
+                                   if name not in {"amp", "lt", "gt", "quot", "apos"})
+            doctype = f"<!DOCTYPE {doctype_name} [{subset}{declarations}]>"
+            return ET.fromstring(text[:start] + doctype + text[end:])
         return ET.fromstring(data)
     except (ET.ParseError, expat.ExpatError, LookupError, UnicodeError) as e:
         raise ValueError(f"Malformed XML: {source_name}") from e
@@ -288,7 +358,7 @@ def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
 
 
 def _parse_xhtml(data: bytes, source_name: str) -> ET.Element:
-    root = _parse_xml(data, source_name, MAX_XHTML_BYTES)
+    root = _parse_xml(data, source_name, MAX_XHTML_BYTES, xhtml_entities=True)
     # Normalize XHTML only; foreign vocabularies must not become HTML elements.
     stack = [(root, 0)]
     while stack:
@@ -310,8 +380,12 @@ def _body_element(root: ET.Element) -> ET.Element:
     return root
 
 
+def _suppressed_element(elem: ET.Element) -> bool:
+    return _strip_ns(elem.tag) in {"script", "style", "head", "svg"}
+
+
 def _visible_elements(root: ET.Element):
-    if root.tag in {"script", "style", "head"}:
+    if _suppressed_element(root):
         return
     yield root
     for child in root:
@@ -319,12 +393,13 @@ def _visible_elements(root: ET.Element):
 
 
 def _visible_text(root: ET.Element, block_separators: bool = False) -> str:
-    if root.tag in {"script", "style", "head"}:
+    if _suppressed_element(root):
         return ""
     text = (root.text or "") + "".join(
         _visible_text(child, block_separators) + (child.tail or "") for child in root
     )
-    return f" {text} " if block_separators and root.tag in MinimalHtmlSanitizer._BLOCKS else text
+    blocks = MinimalHtmlSanitizer._BLOCKS | MinimalHtmlSanitizer._FLATTENED_BLOCKS
+    return f" {text} " if block_separators and root.tag in blocks else text
 
 
 def _fragment_ids(root: ET.Element) -> tuple[str, ...]:
@@ -381,40 +456,56 @@ def _is_supported_image_media_type(media_type: str) -> bool:
     return media_type.lower() in {"image/jpeg", "image/png", "image/gif"}
 
 
-def _resolve_book_href(current_path: str, href: str) -> Optional[Tuple[str, Optional[str]]]:
-    parsed = urllib.parse.urlsplit(href)
+def _document_base_url(root: ET.Element, current_path: str) -> str:
+    document_url = urllib.parse.quote(current_path, safe="/")
+    head = root.find("head") if root.tag == "html" else None
+    if head is not None:
+        for elem in head.iter("base"):
+            if "href" in elem.attrib:
+                return urllib.parse.urljoin(document_url, elem.attrib["href"])
+    return document_url
+
+
+def _resolve_book_href(current_path: str, href: str,
+                       base_url: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
+    document_url = urllib.parse.quote(current_path, safe="/") if base_url is None else base_url
+    parsed = urllib.parse.urlsplit(urllib.parse.urljoin(document_url, href))
     if parsed.scheme or parsed.netloc:
         return None
 
-    target_path = current_path
-    if parsed.path:
-        target_path = _normalize_epub_path(
-            posixpath.join(posixpath.dirname(current_path), urllib.parse.unquote(parsed.path))
-        )
+    target_path = _normalize_epub_path(urllib.parse.unquote(parsed.path))
 
     fragment = urllib.parse.unquote(parsed.fragment) if parsed.fragment else None
     return target_path, fragment
 
 
-def _reported_media_path(current_path: str, href: Optional[str], fallback: str) -> str:
+def _reported_media_path(current_path: str, href: Optional[str], fallback: str,
+                         base_url: Optional[str] = None) -> str:
     if not href:
         return fallback
     if href.startswith("data:"):
         return "<data URI>"
-    resolved = _resolve_book_href(current_path, href)
-    return resolved[0] if resolved else href
+    resolved = _resolve_book_href(current_path, href, base_url)
+    document_url = urllib.parse.quote(current_path, safe="/") if base_url is None else base_url
+    return resolved[0] if resolved else urllib.parse.urljoin(document_url, href)
 
 
 def _media_references(body: ET.Element):
     images = []
     unsupported = []
     inline_svg = False
-    for elem in _visible_elements(body):
+    stack = [body]
+    while stack:
+        elem = stack.pop()
         tag = elem.tag
+        if _strip_ns(tag) == "svg":
+            inline_svg = True
+            continue
+        if _suppressed_element(elem):
+            continue
+        stack.extend(reversed(list(elem)))
         if tag == "img":
             images.append(elem.get("src"))
-        elif tag in {"svg", "{http://www.w3.org/2000/svg}svg"}:
-            inline_svg = True
         elif tag in {"audio", "video"}:
             sources = [elem.get("src")] if elem.get("src") else []
             sources.extend(child.get("src") for child in elem if child.tag == "source" and child.get("src"))
@@ -466,6 +557,7 @@ def _extract_nav_toc_targets(
         return []
 
     toc_targets: list[TocTarget] = []
+    nav_base_url = _document_base_url(nav_root, nav_path)
     for elem in toc_nav.iter():
         if elem.tag != "a":
             continue
@@ -475,7 +567,7 @@ def _extract_nav_toc_targets(
         label = " ".join("".join(elem.itertext()).split())
         if not label:
             continue
-        resolved = _resolve_book_href(nav_path, raw_href)
+        resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
         if resolved is None:
             continue
         target_path, fragment = resolved
@@ -645,6 +737,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         manifest: dict[str, str] = {}
         manifest_media_types: dict[str, str] = {}
         manifest_properties: dict[str, str] = {}
+        manifest_fallbacks: dict[str, str] = {}
         for item in list(manifest_node):
             if _strip_ns(item.tag) == "item":
                 iid = item.attrib.get("id")
@@ -653,6 +746,8 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     manifest[iid] = href
                     manifest_media_types[iid] = item.attrib.get("media-type", "")
                     manifest_properties[iid] = item.attrib.get("properties", "")
+                    if item.attrib.get("fallback"):
+                        manifest_fallbacks[iid] = item.attrib["fallback"]
         manifest_paths = {
             _resolve_manifest_path(base_dir, href): iid
             for iid, href in manifest.items()
@@ -720,12 +815,38 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         extracted_resource_bytes = 0
         spine_items: list[SpineItem] = []
         svg_spine_paths: set[str] = set()
+
+        def select_spine_item(item_id: str) -> tuple[str, tuple[str, ...]]:
+            chain: list[str] = []
+            current = item_id
+            while True:
+                if current in chain:
+                    raise ValueError(f"Cyclic manifest fallback chain: {item_id}")
+                if current not in manifest:
+                    raise ValueError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
+                chain.append(current)
+                media_type = manifest_media_types[current].lower()
+                local = _resolve_book_href(opf_path, manifest[current]) is not None
+                if local and media_type == "application/xhtml+xml":
+                    break
+                fallback = manifest_fallbacks.get(current)
+                if not fallback:
+                    if not local:
+                        raise ValueError(f"Remote spine content is not supported: {manifest[current]}")
+                    if media_type == "image/svg+xml":
+                        break  # Retain the existing SVG omission behavior.
+                    raise ValueError(f"Unsupported spine media type without readable fallback: {media_type}")
+                current = fallback
+            aliases = tuple(_resolve_manifest_path(base_dir, manifest[iid]) for iid in chain
+                            if _resolve_book_href(opf_path, manifest[iid]) is not None)
+            for iid in chain[:-1]:
+                record_omission(_reported_media_path(opf_path, manifest[iid], manifest[iid]),
+                                opf_path, "spine resource replaced by manifest fallback")
+            return current, aliases
+
         for spine_idx, (item_id, linear) in enumerate(spine_refs, start=1):
-            rel = manifest.get(item_id)
-            if not rel:
-                raise ValueError(f"Malformed OPF: spine item '{item_id}' is missing from manifest")
-            if _resolve_book_href(opf_path, rel) is None:
-                raise ValueError(f"Remote spine content is not supported: {rel}")
+            item_id, aliases = select_spine_item(item_id)
+            rel = manifest[item_id]
             full = _resolve_manifest_path(base_dir, rel)
             if manifest_media_types.get(item_id, "").lower() == "image/svg+xml":
                 svg_spine_paths.add(full)
@@ -746,30 +867,39 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 body = _body_element(document)
             except ValueError as e:
                 raise ValueError(f"Invalid XHTML: {full}: {e}") from e
+            anchor = f"spine_{spine_idx}"
+            body_fragments = tuple(body.get(key) for key in ("id", "name")
+                                   if body.tag == "body" and body.get(key))
+            fragment_anchors = {fragment: anchor for fragment in body_fragments}
+            for fragment_idx, fragment in enumerate(_fragment_ids(body), start=1):
+                if fragment not in fragment_anchors:
+                    fragment_anchors[fragment] = f"{anchor}_frag_{fragment_idx}"
             spine_items.append(
                 SpineItem(
                     index=spine_idx,
                     href=rel,
                     full_path=full,
-                    anchor=f"spine_{spine_idx}",
+                    aliases=aliases,
+                    base_url=_document_base_url(document, full),
+                    anchor=anchor,
                     stem=Path(rel).stem,
                     document=document,
                     body=body,
-                    body_fragments=tuple(body.get(key) for key in ("id", "name") if body.get(key)) if body.tag == "body" else (),
+                    body_fragments=body_fragments,
+                    fragment_anchors=fragment_anchors,
                     linear=linear,
                 )
             )
 
-        file_anchor_map = {item.full_path: item.anchor for item in spine_items}
+        file_anchor_map: dict[str, str] = {}
         fragment_anchor_map: dict[tuple[str, str], str] = {}
+        # References from other documents to a shared fallback choose its first
+        # occurrence. Each occurrence retains its own markers and self-links.
         for item in spine_items:
-            for fragment in item.body_fragments:
-                fragment_anchor_map[(item.full_path, fragment)] = item.anchor
-            fragments = _fragment_ids(item.body)
-            for fragment_idx, fragment in enumerate(fragments, start=1):
-                if fragment in item.body_fragments:
-                    continue
-                fragment_anchor_map[(item.full_path, fragment)] = f"{item.anchor}_frag_{fragment_idx}"
+            for path in item.aliases:
+                file_anchor_map.setdefault(path, item.anchor)
+                for fragment, anchor in item.fragment_anchors.items():
+                    fragment_anchor_map.setdefault((path, fragment), anchor)
 
         image_path_to_recindex: dict[str, int] = {}
         image_records: list[bytes] = []
@@ -778,16 +908,16 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             if inline_svg and item.full_path not in svg_spine_paths:
                 record_omission("<inline SVG>", item.full_path, "inline SVG is not rendered")
             for kind, raw_src in unsupported:
-                resource = _reported_media_path(item.full_path, raw_src, f"<{kind}>")
+                resource = _reported_media_path(item.full_path, raw_src, f"<{kind}>", item.base_url)
                 record_omission(resource, item.full_path, f"{kind} is not supported")
 
             for raw_src in image_sources:
                 if not raw_src:
                     record_omission("<img without src>", item.full_path, "image has no source")
                     continue
-                resolved = _resolve_book_href(item.full_path, raw_src)
+                resolved = _resolve_book_href(item.full_path, raw_src, item.base_url)
                 if resolved is None:
-                    resource = "<data URI>" if raw_src.startswith("data:") else raw_src
+                    resource = _reported_media_path(item.full_path, raw_src, raw_src, item.base_url)
                     record_omission(resource, item.full_path, "external or data URI image is not embedded")
                     continue
                 target_path, _fragment = resolved
@@ -819,7 +949,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         parts: list[str] = []
         fallback_toc: list[tuple[str, str, str, int]] = []
         for item in spine_items:
-            ncx_title = next((target.label for target in ncx_targets if target.path == item.full_path and target.fragment is None), None)
+            ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
             guessed_title = _extract_title(item.document)
             chapter_title = ncx_title or guessed_title
             if (
@@ -835,6 +965,10 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 file_anchor_map=file_anchor_map,
                 fragment_anchor_map=fragment_anchor_map,
                 image_path_to_recindex=image_path_to_recindex,
+                base_url=item.base_url,
+                current_aliases=item.aliases,
+                fragment_anchors=item.fragment_anchors,
+                file_anchor=item.anchor,
             )
             clean = sanitizer.sanitize(item.body)
             parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
@@ -858,7 +992,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     continue
                 if anchor in seen_anchors:
                     continue
-                spine_item = next((item for item in spine_items if item.full_path == target.path), None)
+                spine_item = next((item for item in spine_items if target.path in item.aliases), None)
                 if spine_item is None:
                     unresolved = True
                     continue
@@ -941,8 +1075,11 @@ class MinimalHtmlSanitizer:
         {"b", "i", "strong", "em", "code", "span", "a", "img", "mbp:pagebreak"}
     )
     _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
-
-    _SUPPRESSED: frozenset[str] = frozenset({"script", "style", "head"})
+    _FLATTENED_BLOCKS: frozenset[str] = frozenset({
+        "dl", "dt", "dd", "section", "article", "aside", "header", "footer",
+        "main", "nav", "figure", "figcaption", "address", "caption", "details",
+        "summary", "hgroup", "form", "fieldset", "legend", "menu",
+    })
     _HEADING_HINTS: frozenset[str] = frozenset({"chapter-title", "chap-title", "heading", "chapterhead", "chapter-heading"})
     _CENTER_HINTS: frozenset[str] = frozenset({"center", "centre", "centered", "centred", "epigraph", "ornament", "separator", "scene-break", "scenebreak", "asterism", "dinkus"})
     _RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "credit", "byline", "source"})
@@ -953,11 +1090,21 @@ class MinimalHtmlSanitizer:
         file_anchor_map: dict[str, str],
         fragment_anchor_map: dict[tuple[str, str], str],
         image_path_to_recindex: dict[str, int],
+        base_url: Optional[str] = None,
+        current_aliases: Optional[tuple[str, ...]] = None,
+        fragment_anchors: Optional[dict[str, str]] = None,
+        file_anchor: Optional[str] = None,
     ):
         self.current_path = current_path
         self.file_anchor_map = file_anchor_map
         self.fragment_anchor_map = fragment_anchor_map
         self.image_path_to_recindex = image_path_to_recindex
+        self.base_url = urllib.parse.quote(current_path, safe="/") if base_url is None else base_url
+        self.current_aliases = current_aliases or (current_path,)
+        self.fragment_anchors = (fragment_anchors if fragment_anchors is not None else
+                                 {fragment: target for (path, fragment), target in fragment_anchor_map.items()
+                                  if path == current_path})
+        self.file_anchor = file_anchor if file_anchor is not None else file_anchor_map.get(current_path)
         self.fed: list[str] = []
 
     def _ensure_block_sep(self) -> None:
@@ -986,28 +1133,32 @@ class MinimalHtmlSanitizer:
             return "right"
         return None
 
-    def _inject_named_anchors(self, attrs) -> None:
+    def _inject_named_anchors(self, attrs, in_link: bool = False) -> None:
         seen: set[str] = set()
         for key, value in attrs:
             if key not in {"id", "name"} or not value or value in seen:
                 continue
             seen.add(value)
-            target = self.fragment_anchor_map.get((self.current_path, value))
+            target = self.fragment_anchors.get(value)
             if target:
-                self.fed.append(f'<a name="{target}" id="{target}"></a>')
+                marker = (f'<span id="{target}"></span>' if in_link else
+                          f'<a name="{target}" id="{target}"></a>')
+                self.fed.append(marker)
 
     def _rewrite_href(self, href: str) -> Optional[str]:
-        resolved = _resolve_book_href(self.current_path, href)
+        resolved = _resolve_book_href(self.current_path, href, self.base_url)
         if resolved is None:
-            return href
+            return urllib.parse.urljoin(self.base_url, href)
 
         target_path, fragment = resolved
         if fragment:
-            exact = self.fragment_anchor_map.get((target_path, fragment))
+            exact = (self.fragment_anchors.get(fragment) if target_path in self.current_aliases else
+                     self.fragment_anchor_map.get((target_path, fragment)))
             if exact:
                 return f"#{exact}"
 
-        fallback = self.file_anchor_map.get(target_path)
+        fallback = (self.file_anchor if target_path in self.current_aliases else
+                    self.file_anchor_map.get(target_path))
         if fallback:
             return f"#{fallback}"
         return None
@@ -1017,13 +1168,13 @@ class MinimalHtmlSanitizer:
         self._emit(body)
         return "".join(self.fed)
 
-    def _emit(self, elem: ET.Element, flatten_table: bool = False) -> None:
+    def _emit(self, elem: ET.Element, flatten_table: bool = False, in_link: bool = False) -> None:
         tag = elem.tag
-        if tag in self._SUPPRESSED:
+        if _suppressed_element(elem):
             return
         attrs = elem.attrib
         if tag != "body":
-            self._inject_named_anchors(attrs.items())
+            self._inject_named_anchors(attrs.items(), in_link)
         if tag == "table":
             flatten_table = flatten_table or any(
                 (child is not elem and child.tag == "table")
@@ -1039,7 +1190,7 @@ class MinimalHtmlSanitizer:
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
         if tag == "img":
             src = attrs.get("src", "")
-            resolved = _resolve_book_href(self.current_path, src) if src else None
+            resolved = _resolve_book_href(self.current_path, src, self.base_url) if src else None
             recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
             if recindex is not None:
                 self.fed.append(f'<img recindex="{recindex}"/>')
@@ -1062,10 +1213,12 @@ class MinimalHtmlSanitizer:
             self.fed.append(f"<{output_tag}{attr_str}>")
         elif table_tag:
             self.fed.append(" ")
+        elif tag in self._FLATTENED_BLOCKS:
+            self._ensure_block_sep()
         if elem.text:
             self.fed.append(htmlmod.escape(elem.text, quote=False))
         for child in elem:
-            self._emit(child, flatten_table)
+            self._emit(child, flatten_table, in_link or output_tag == "a")
             if child.tail:
                 self.fed.append(htmlmod.escape(child.tail, quote=False))
         if output_tag:
@@ -1074,18 +1227,29 @@ class MinimalHtmlSanitizer:
                 self.fed.append("\n")
         elif table_tag:
             self.fed.append("\n" if tag in {"tr", "table"} else " ")
+        elif tag in self._FLATTENED_BLOCKS:
+            self._ensure_block_sep()
 
 
 class MobiWriter:
     def __init__(self, epub: EpubData):
         self.epub = epub
 
+    @staticmethod
+    def _anchor_position(body_bytes: bytes, anchor: bytes) -> int:
+        # IDs inside hyperlinks use a span marker to avoid nested anchors.
+        for marker in (b'<a name="' + anchor + b'" id="' + anchor + b'"></a>',
+                       b'<span id="' + anchor + b'"></span>'):
+            pos = body_bytes.find(marker)
+            if pos != -1:
+                return pos
+        return -1
+
     def _find_anchor_positions(self, body_bytes: bytes) -> list[int]:
         anchors = [a for a, _ in self.epub.toc_entries]
         anchor_positions: list[int] = []
         for anchor in anchors:
-            tag = _encode_mobi_text(f'<a name="{anchor}" id="{anchor}"></a>')
-            pos = body_bytes.find(tag)
+            pos = self._anchor_position(body_bytes, _encode_mobi_text(anchor))
             if pos == -1:
                 raise ValueError(f"TOC anchor not found in content: {anchor}")
             anchor_positions.append(pos)
@@ -1137,8 +1301,7 @@ class MobiWriter:
 
         def replace(match: re.Match[bytes]) -> bytes:
             anchor = match.group(2)
-            tag = b'<a name="' + anchor + b'" id="' + anchor + b'"></a>'
-            if tag not in body_bytes:
+            if MobiWriter._anchor_position(body_bytes, anchor) == -1:
                 return match.group(1)
             targets.append(anchor)
             return match.group(1) + b' filepos="??????????"'
@@ -1148,7 +1311,7 @@ class MobiWriter:
     @staticmethod
     def _finish_internal_links(body_bytes: bytes, body_start: int, targets: list[bytes]) -> bytes:
         positions = {
-            anchor: body_bytes.find(b'<a name="' + anchor + b'" id="' + anchor + b'"></a>')
+            anchor: MobiWriter._anchor_position(body_bytes, anchor)
             for anchor in targets
         }
         target_iter = iter(targets)
