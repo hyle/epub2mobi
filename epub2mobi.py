@@ -64,6 +64,7 @@ TOC_FILEPOS_MAX = 10 ** TOC_FILEPOS_WIDTH
 # XML parsing guardrails for untrusted EPUBs
 MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_XHTML_BYTES = 16 * 1024 * 1024
+MAX_CSS_BYTES = 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
 
@@ -691,6 +692,173 @@ def _read_xml_member(z: zipfile.ZipFile, member_path: str) -> bytes:
     return data
 
 
+def _css_parts(text: str, separators: str):
+    """Split outside comments, strings and parentheses/brackets; retain delimiters."""
+    part: list[str] = []
+    stack: list[str] = []
+    quote = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if quote:
+            part.append(char)
+            if char == "\\" and i + 1 < len(text):
+                i += 1
+                part.append(text[i])
+            elif char == quote:
+                quote = None
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                # An unfinished comment consumes the rest of the source.
+                break
+            # Keep tokens on either side from merging into a supported identifier.
+            part.append(" ")
+            i = end + 1
+        elif char == "\\":
+            # Escaped syntax remains unsupported, but cannot become a delimiter.
+            part.append(char)
+            if i + 1 < len(text):
+                i += 1
+                part.append(text[i])
+        elif char in "\"'":
+            quote = char
+            part.append(char)
+        elif char in "([":
+            stack.append(")" if char == "(" else "]")
+            part.append(char)
+        elif stack and char == stack[-1]:
+            stack.pop()
+            part.append(char)
+        elif not stack and char in separators:
+            yield "".join(part), char
+            part = []
+        else:
+            part.append(char)
+        i += 1
+    # Unclosed strings/functions must not turn into supported declarations.
+    if not quote and not stack:
+        yield "".join(part), ""
+
+
+def _css_value(property_name: str, value: str) -> Optional[str]:
+    value = value.strip().lower()
+    if value == "inherit" and property_name in {"font-style", "font-weight", "text-align", "text-indent"}:
+        return value
+    if property_name == "font-style" and value in {"normal", "italic", "oblique"}:
+        return "italic" if value == "oblique" else value
+    if property_name == "font-weight":
+        if value in {"normal", "bold"}:
+            return value
+        if re.fullmatch(r"[1-9]00", value):
+            return "bold" if int(value) >= 600 else "normal"
+    if property_name == "text-align" and value in {"left", "right", "center", "justify"}:
+        return value
+    if property_name == "text-indent":
+        if value == "0":
+            return "0"
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?|\.[0-9]+)(em|pt)", value)
+        if match:
+            # Normalize without floating point rounding or scientific notation.
+            number = match[1].lstrip("0")
+            if "." in number:
+                number = number.rstrip("0").rstrip(".")
+            if not number:
+                return "0"
+            if number.startswith("."):
+                number = "0" + number
+            return number + match[2]
+    return None
+
+
+def _css_declarations(text: str) -> dict[str, str]:
+    declarations: dict[str, str] = {}
+    for declaration, _ in _css_parts(text, ";"):
+        parts = list(_css_parts(declaration, ":"))
+        if len(parts) != 2 or parts[0][1] != ":":
+            continue
+        name = parts[0][0].strip().lower()
+        value = _css_value(name, parts[1][0])
+        if value is not None:
+            declarations[name] = value
+    return declarations
+
+
+def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
+    """Read flat rules, skipping entire at-rule and malformed nested blocks."""
+    rules = []
+    depth = 0
+    prelude = ""
+    body: list[str] = []
+    nested = False
+    for part, delimiter in _css_parts(text, "{};"):
+        if depth == 0:
+            if delimiter == "{":
+                prelude, body, nested = part.strip(), [], False
+                depth = 1
+        else:
+            if delimiter == "{":
+                nested = True
+                depth += 1
+            elif delimiter == "}":
+                depth -= 1
+                if depth == 0 and not nested and not prelude.startswith("@"):
+                    declarations = _css_declarations("".join(body) + part)
+                    selectors = [selector.strip() for selector in prelude.split(",")]
+                    # A selector list containing unsupported syntax is skipped whole.
+                    if declarations and all(re.fullmatch(r"\.?(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*", s) for s in selectors):
+                        rules.extend((s if s.startswith(".") else s.lower(), declarations) for s in selectors)
+            if depth == 1 and not nested:
+                body.append(part + delimiter)
+    return rules
+
+
+class _CssStyles:
+    """Resolve just the four supported inherited properties per document."""
+
+    def __init__(self, document: ET.Element, rules: list[tuple[str, dict[str, str]]]):
+        by_selector: dict[str, dict[str, tuple[int, str]]] = {}
+        for order, (selector, declarations) in enumerate(rules):
+            target = by_selector.setdefault(selector, {})
+            target.update((name, (order, value)) for name, value in declarations.items())
+        self.styles: dict[ET.Element, dict[str, str]] = {}
+        self.font_runs = False
+
+        def resolve(elem: ET.Element, parent: dict[str, str]) -> None:
+            if _suppressed_element(elem):
+                return
+            chosen = {name: (0, order, value)
+                      for name, (order, value) in by_selector.get(elem.tag, {}).items()}
+            for cls in set(elem.get("class", "").split()):
+                for name, (order, value) in by_selector.get("." + cls, {}).items():
+                    candidate = (1, order, value)
+                    if name not in chosen or candidate[:2] > chosen[name][:2]:
+                        chosen[name] = candidate
+            local = {name: value for name, (_, _, value) in chosen.items()}
+            local.update(_css_declarations(elem.get("style", "")))
+            self.font_runs |= bool(local.keys() & {"font-style", "font-weight"})
+            style = dict(parent)
+            # Semantic markup provides local defaults, which authored CSS can reset.
+            heading_hint = (elem.tag in {"p", "div"} and
+                            MinimalHtmlSanitizer._tokenize_hints(elem.get("class", ""), elem.get("id", ""))
+                            & MinimalHtmlSanitizer._HEADING_HINTS)
+            if elem.tag in {"b", "strong", "th", "h1", "h2", "h3", "h4", "h5", "h6"} or heading_hint:
+                style["font-weight"] = "bold"
+            if elem.tag in {"i", "em"}:
+                style["font-style"] = "italic"
+            for name, value in local.items():
+                if value == "inherit":
+                    style[name] = parent.get(name, {"font-weight": "normal", "font-style": "normal",
+                                                   "text-align": "left", "text-indent": "0"}[name])
+                else:
+                    style[name] = value
+            self.styles[elem] = style
+            for child in elem:
+                resolve(child, style)
+
+        resolve(document, {})
+
+
 def _marc_creator_role(value: str) -> Optional[str]:
     value = value.strip().lower()
     for prefix in ("http://id.loc.gov/vocabulary/relators/", "https://id.loc.gov/vocabulary/relators/"):
@@ -1051,6 +1219,63 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     if recindex is not None:
                         cover_index = recindex - 1
 
+        css_cache: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        css_errors: dict[str, str] = {}
+
+        def document_styles(item: SpineItem) -> _CssStyles:
+            nonlocal extracted_resource_bytes
+            rules: list[tuple[str, dict[str, str]]] = []
+            stack = [item.document]
+            while stack:
+                elem = stack.pop()
+                # Head styles are intentional; foreign vocabularies and scripts are not.
+                if elem.tag.startswith("{") or elem.tag in {"svg", "script"}:
+                    continue
+                if elem.tag != "style":
+                    stack.extend(reversed(list(elem)))
+                if elem.tag not in {"style", "link"}:
+                    continue
+                if (elem.get("type", "text/css").strip().lower() not in {"", "text/css"}
+                        or elem.get("media", "all").strip().lower() not in {"", "all"}
+                        or "disabled" in elem.attrib):
+                    continue
+                if elem.tag == "style":
+                    text = "".join(elem.itertext())
+                    if len(text.encode("utf-8")) > MAX_CSS_BYTES:
+                        raise ValueError(f"CSS file too large: embedded style in {item.full_path}")
+                    rules.extend(_css_rules(text))
+                    continue
+                rel = elem.get("rel", "").lower().split()
+                href = elem.get("href")
+                if "stylesheet" not in rel or "alternate" in rel or not href:
+                    continue
+                resolved = _resolve_book_href(item.full_path, href, item.base_url)
+                if resolved is None:
+                    record_omission(_reported_media_path(item.full_path, href, href, item.base_url),
+                                    item.full_path, "external or data URI stylesheet is not loaded")
+                    continue
+                path = resolved[0]
+                if path not in css_cache:
+                    css_cache[path] = []
+                    try:
+                        data, extracted_resource_bytes = _read_zip_member(
+                            z, path, size_limit=MAX_CSS_BYTES,
+                            aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+                            aggregate_used=extracted_resource_bytes, kind="CSS file")
+                    except KeyError:
+                        css_errors[path] = "stylesheet is missing"
+                    else:
+                        try:
+                            text = data.decode("utf-8-sig")
+                        except UnicodeDecodeError:
+                            css_errors[path] = "stylesheet is not UTF-8"
+                        else:
+                            css_cache[path] = _css_rules(text)
+                if path in css_errors:
+                    record_omission(path, item.full_path, css_errors[path])
+                rules.extend(css_cache[path])
+            return _CssStyles(item.document, rules)
+
         parts: list[str] = []
         fallback_toc: list[tuple[str, str, str, int]] = []
         for item in spine_items:
@@ -1074,6 +1299,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 current_aliases=item.aliases,
                 fragment_anchors=item.fragment_anchors,
                 file_anchor=item.anchor,
+                styles=document_styles(item),
             )
             clean = sanitizer.sanitize(item.body)
             parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
@@ -1200,6 +1426,7 @@ class MinimalHtmlSanitizer:
         current_aliases: Optional[tuple[str, ...]] = None,
         fragment_anchors: Optional[dict[str, str]] = None,
         file_anchor: Optional[str] = None,
+        styles: Optional[_CssStyles] = None,
     ):
         self.current_path = current_path
         self.file_anchor_map = file_anchor_map
@@ -1212,6 +1439,7 @@ class MinimalHtmlSanitizer:
                                   if path == current_path})
         self.file_anchor = file_anchor if file_anchor is not None else file_anchor_map.get(current_path)
         self.fed: list[str] = []
+        self.styles = styles
 
     def _ensure_block_sep(self) -> None:
         if self.fed:
@@ -1229,10 +1457,8 @@ class MinimalHtmlSanitizer:
     @staticmethod
     def _derive_alignment(style: str, hint_tokens: set[str]) -> Optional[str]:
         normalized = style.lower().replace(" ", "")
-        if "text-align:center" in normalized or ("margin-left:auto" in normalized and "margin-right:auto" in normalized):
+        if "margin-left:auto" in normalized and "margin-right:auto" in normalized:
             return "center"
-        if "text-align:right" in normalized:
-            return "right"
         if hint_tokens & MinimalHtmlSanitizer._CENTER_HINTS:
             return "center"
         if hint_tokens & MinimalHtmlSanitizer._RIGHT_HINTS:
@@ -1271,14 +1497,26 @@ class MinimalHtmlSanitizer:
 
     def sanitize(self, body: ET.Element) -> str:
         self.fed = []
+        if self.styles is None or body not in self.styles.styles:
+            self.styles = _CssStyles(body, [])
         self._emit(body)
         return "".join(self.fed)
+
+    def _emit_text(self, text: str, style: dict[str, str]) -> None:
+        text = htmlmod.escape(text, quote=False)
+        if self.styles.font_runs:
+            if style.get("font-style") == "italic":
+                text = f"<i>{text}</i>"
+            if style.get("font-weight") == "bold":
+                text = f"<b>{text}</b>"
+        self.fed.append(text)
 
     def _emit(self, elem: ET.Element, flatten_table: bool = False, in_link: bool = False) -> None:
         tag = elem.tag
         if _suppressed_element(elem):
             return
         attrs = elem.attrib
+        style = self.styles.styles.get(elem, {})
         if tag != "body":
             self._inject_named_anchors(attrs.items(), in_link)
         if tag == "table":
@@ -1294,6 +1532,14 @@ class MinimalHtmlSanitizer:
         if output_tag in {"p", "div"} and hints & self._HEADING_HINTS:
             output_tag = "h2"
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
+        if self.styles.font_runs and output_tag in {"b", "i"}:
+            output_tag = None
+        if (self.styles.font_runs and output_tag in {"th", "h1", "h2", "h3", "h4", "h5", "h6"}
+                and any(self.styles.styles.get(child, {}).get("font-weight") == "normal"
+                        for child in _visible_elements(elem))):
+            # Native MOBI headings/header cells impose bold on descendants.
+            # Ordinary blocks/cells allow normal-weight runs to reset it.
+            output_tag = "td" if output_tag == "th" else "p"
         if tag == "img":
             src = attrs.get("src", "")
             resolved = _resolve_book_href(self.current_path, src, self.base_url) if src else None
@@ -1311,9 +1557,11 @@ class MinimalHtmlSanitizer:
                 if href:
                     attr_str = f' href="{htmlmod.escape(href, quote=True)}"'
             elif output_tag in self._BLOCKS:
-                align = self._derive_alignment(attrs.get("style", ""), hints)
+                align = style.get("text-align") or self._derive_alignment(attrs.get("style", ""), hints)
                 if align:
                     attr_str = f' align="{align}"'
+                if output_tag in {"p", "div", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"} and "text-indent" in style:
+                    attr_str += f' width="{style["text-indent"]}"'
             if output_tag in self._BLOCKS:
                 self._ensure_block_sep()
             self.fed.append(f"<{output_tag}{attr_str}>")
@@ -1322,11 +1570,11 @@ class MinimalHtmlSanitizer:
         elif tag in self._FLATTENED_BLOCKS:
             self._ensure_block_sep()
         if elem.text:
-            self.fed.append(htmlmod.escape(elem.text, quote=False))
+            self._emit_text(elem.text, style)
         for child in elem:
             self._emit(child, flatten_table, in_link or output_tag == "a")
             if child.tail:
-                self.fed.append(htmlmod.escape(child.tail, quote=False))
+                self._emit_text(child.tail, style)
         if output_tag:
             self.fed.append(f"</{output_tag}>")
             if output_tag in self._BLOCKS:
@@ -2018,7 +2266,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 def _log_media_omissions(omissions: tuple[MediaOmission, ...], detailed: bool) -> None:
     if not omissions:
         if detailed:
-            logger.info("No omissions detected by the media scan; CSS assets were not inspected.")
+            logger.info("No omissions detected by the media scan; CSS background assets were not inspected.")
         return
 
     logger.warning(
