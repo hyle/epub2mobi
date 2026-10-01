@@ -81,6 +81,29 @@ EXTH_COVER_OFFSET = 201
 DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
 OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
 
+# Recognized MARC relators, including discontinued codes found in older EPUBs.
+# Source: https://www.loc.gov/marc/relators/relacode.html (checked 2026-10-01).
+# Keep this local so conversion never needs a network lookup. Unknown roles
+# remain unspecified rather than causing creator credits to be discarded.
+_MARC_RELATOR_CODES = frozenset("""
+    abr acp act adi adp afd aft anc anl anm ann ant ape apl app aqt arc ard arr art
+    asg asn ato att auc aud aue aui aup aus aut bdd bjd bka bkd bkp blw bnd bpd brd
+    brl bsl cad cas ccp chr clb cli cll clr clt cmm cmp cmt cnd cng cns coe col com
+    con cop cor cos cot cou cov cpc cpe cph cpl cpt cre crp crr crt csl csp cst ctb
+    cte ctg ctr cts ctt cur cwt dbd dbp dfd dfe dft dgc dgg dgs dis djo dln dnc dnr
+    dpc dpt drm drt dsr dst dtc dte dtm dto dub edc edd edm edt egr elg elt eng enj
+    etr evp exp fac fds fld flm fmd fmk fmo fmp fnd fon fpy frg gdv gis grt gst his
+    hnr hst ill ilu ink ins inv isb itr ive ivr jud jug lbr lbt ldr led lee lel len
+    let lgd lie lil lit lsa lse lso ltg ltr lyr mcp mdc med mfp mfr mka mod mon mrb
+    mrk msd mte mtk mup mus mxe nan nrt onp opn org orm osp oth own pad pan pat pbd
+    pbl pdr pfr pht plt pma pmn pnc pop ppm ppt pra prc prd pre prf prg prm prn pro
+    prp prs prt prv pta pte ptf pth ptt pup rap rbr rcd rce rcp rdd red ren res rev
+    rpc rps rpt rpy rse rsg rsp rsr rst rth rtm rxa sad sce scl scr sde sds sec sfx
+    sgd sgn sht sll sng spk spn spy srv std stg stl stm stn str swd tad tau tcd tch
+    ths tld tlg tlh tlp trc trl tyd tyg uvp vac vdg vfx voc wac wal wap wam wat waw
+    wdc wde wfs wft wfw win wit wpr wst wts
+""".split())
+
 # MOBI Header Offsets (Relative to MOBI Magic)
 OFF_LENGTH = 0x04
 OFF_TYPE = 0x08
@@ -554,7 +577,7 @@ def _extract_nav_toc_targets(
         return []
 
     toc_nav = None
-    for elem in nav_root.iter():
+    for elem in _visible_elements(nav_root):
         if elem.tag != "nav":
             continue
         nav_type = ""
@@ -571,13 +594,13 @@ def _extract_nav_toc_targets(
 
     toc_targets: list[TocTarget] = []
     nav_base_url = _document_base_url(nav_root, nav_path)
-    for elem in toc_nav.iter():
+    for elem in _visible_elements(toc_nav):
         if elem.tag != "a":
             continue
         raw_href = elem.attrib.get("href")
         if not raw_href:
             continue
-        label = " ".join("".join(elem.itertext()).split())
+        label = " ".join(_visible_text(elem).split())
         if not label:
             continue
         resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
@@ -1000,7 +1023,7 @@ def _marc_creator_role(value: str) -> Optional[str]:
         if value.startswith(prefix):
             value = value[len(prefix):]
             break
-    return value if re.fullmatch(r"[a-z]{3}", value) else None
+    return value if value in _MARC_RELATOR_CODES else None
 
 
 def _metadata_author(metadata: list[ET.Element]) -> str:
