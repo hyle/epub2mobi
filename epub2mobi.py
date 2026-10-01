@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 # --- LOGGING ---
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("epub2mobi")
 
 # --- CONSTANTS ---
@@ -181,6 +180,10 @@ class TocTarget:
     path: str
     fragment: Optional[str]
     label: str
+
+
+class _NavigationSizeError(ValueError):
+    """The logical TOC cannot fit the supported single-record layout."""
 
 
 def _palm_time_now() -> int:
@@ -703,21 +706,31 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         fallback_uuid = None
         chosen_uuid = None
 
-        for elem in opf_root.iter():
-            t = _strip_ns(elem.tag)
-            if t == "title" and elem.text:
-                book_title = elem.text.strip() or book_title
-            elif t == "creator" and elem.text:
-                book_author = elem.text.strip() or book_author
-            elif elem.tag == "{http://purl.org/dc/elements/1.1/}language" and elem.text and not book_language:
-                book_language = elem.text.strip() or None
-            elif t == "identifier" and elem.text:
-                ident = elem.text.strip()
+        metadata = next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ())
+        titles: list[str] = []
+        creators: list[str] = []
+        dc_namespace = "{http://purl.org/dc/elements/1.1/}"
+        for elem in metadata:
+            value = (elem.text or "").strip()
+            if not value:
+                continue
+            if elem.tag == dc_namespace + "title":
+                titles.append(value)
+            elif elem.tag == dc_namespace + "creator":
+                creators.append(value)
+            elif elem.tag == dc_namespace + "language" and not book_language:
+                book_language = value
+            elif elem.tag == dc_namespace + "identifier":
+                ident = value
                 if ident and not fallback_uuid:
                     fallback_uuid = ident
                 if unique_id and elem.attrib.get("id") == unique_id and ident:
                     chosen_uuid = ident
 
+        if titles:
+            book_title = titles[0]
+        if creators:
+            book_author = "; ".join(creators)
         if chosen_uuid:
             book_uuid = chosen_uuid
         elif fallback_uuid:
@@ -1072,7 +1085,7 @@ class MinimalHtmlSanitizer:
         }
     )
     _INLINE: frozenset[str] = frozenset(
-        {"b", "i", "strong", "em", "code", "span", "a", "img", "mbp:pagebreak"}
+        {"b", "i", "strong", "em", "sup", "sub", "u", "code", "span", "a", "img", "mbp:pagebreak"}
     )
     _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
     _FLATTENED_BLOCKS: frozenset[str] = frozenset({
@@ -1236,21 +1249,19 @@ class MobiWriter:
         self.epub = epub
 
     @staticmethod
-    def _anchor_position(body_bytes: bytes, anchor: bytes) -> int:
+    def _anchor_positions(body_bytes: bytes) -> dict[bytes, int]:
         # IDs inside hyperlinks use a span marker to avoid nested anchors.
-        for marker in (b'<a name="' + anchor + b'" id="' + anchor + b'"></a>',
-                       b'<span id="' + anchor + b'"></span>'):
-            pos = body_bytes.find(marker)
-            if pos != -1:
-                return pos
-        return -1
+        positions: dict[bytes, int] = {}
+        for match in re.finditer(rb'<a name="([^"]+)" id="\1"></a>|<span id="([^"]+)"></span>', body_bytes):
+            positions.setdefault(match.group(1) or match.group(2), match.start())
+        return positions
 
-    def _find_anchor_positions(self, body_bytes: bytes) -> list[int]:
+    def _find_anchor_positions(self, positions: dict[bytes, int]) -> list[int]:
         anchors = [a for a, _ in self.epub.toc_entries]
         anchor_positions: list[int] = []
         for anchor in anchors:
-            pos = self._anchor_position(body_bytes, _encode_mobi_text(anchor))
-            if pos == -1:
+            pos = positions.get(_encode_mobi_text(anchor))
+            if pos is None:
                 raise ValueError(f"TOC anchor not found in content: {anchor}")
             anchor_positions.append(pos)
         return anchor_positions
@@ -1283,12 +1294,12 @@ class MobiWriter:
             "</guide>"
         )
 
-    def _compute_toc_positions(self, html_prefix_len: int, body_bytes: bytes) -> list[int]:
+    def _compute_toc_positions(self, html_prefix_len: int, positions: dict[bytes, int]) -> list[int]:
         entries = self.epub.toc_entries
         if len(entries) < 2:
             return []
 
-        body_anchor_positions = self._find_anchor_positions(body_bytes)
+        body_anchor_positions = self._find_anchor_positions(positions)
         provisional_positions = [0] * len(entries)
         # Fixed-width filepos digits keep TOC byte length stable between provisional/final passes.
         provisional_toc = _encode_mobi_text(MobiWriter._build_toc_html(entries, provisional_positions))
@@ -1296,12 +1307,12 @@ class MobiWriter:
         return [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
 
     @staticmethod
-    def _prepare_internal_links(body_bytes: bytes) -> tuple[bytes, list[bytes]]:
+    def _prepare_internal_links(body_bytes: bytes, positions: dict[bytes, int]) -> tuple[bytes, list[bytes]]:
         targets: list[bytes] = []
 
         def replace(match: re.Match[bytes]) -> bytes:
             anchor = match.group(2)
-            if MobiWriter._anchor_position(body_bytes, anchor) == -1:
+            if anchor not in positions:
                 return match.group(1)
             targets.append(anchor)
             return match.group(1) + b' filepos="??????????"'
@@ -1309,11 +1320,8 @@ class MobiWriter:
         return re.sub(rb'(<a\b[^>]*?) href="#([^"]+)"', replace, body_bytes), targets
 
     @staticmethod
-    def _finish_internal_links(body_bytes: bytes, body_start: int, targets: list[bytes]) -> bytes:
-        positions = {
-            anchor: MobiWriter._anchor_position(body_bytes, anchor)
-            for anchor in targets
-        }
+    def _finish_internal_links(body_bytes: bytes, body_start: int, targets: list[bytes],
+                               positions: dict[bytes, int]) -> bytes:
         target_iter = iter(targets)
 
         def replace(match: re.Match[bytes]) -> bytes:
@@ -1333,9 +1341,11 @@ class MobiWriter:
         html_suffix = "</body></html>"
 
         prefix_bytes = _encode_mobi_text(html_prefix)
-        body_bytes, internal_targets = self._prepare_internal_links(
-            _encode_mobi_text(self.epub.html_content)
-        )
+        body_bytes = _encode_mobi_text(self.epub.html_content)
+        body_bytes, internal_targets = self._prepare_internal_links(body_bytes, self._anchor_positions(body_bytes))
+        # Replacements change byte offsets. Scan once more, then share these
+        # positions between TOC construction and final fixed-width link values.
+        positions = self._anchor_positions(body_bytes)
         guide_bytes = b""
         toc_bytes = b""
         toc_filepos = None
@@ -1346,12 +1356,12 @@ class MobiWriter:
             toc_filepos = len(prefix_bytes) + len(provisional_guide)
             guide_bytes = _encode_mobi_text(MobiWriter._build_guide_html(toc_filepos))
             toc_prefix_len += len(guide_bytes)
-            final_positions = self._compute_toc_positions(toc_prefix_len, body_bytes)
+            final_positions = self._compute_toc_positions(toc_prefix_len, positions)
             toc_entry_positions = tuple(final_positions)
             toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions))
 
         body_bytes = self._finish_internal_links(
-            body_bytes, len(prefix_bytes) + len(guide_bytes) + len(toc_bytes), internal_targets
+            body_bytes, len(prefix_bytes) + len(guide_bytes) + len(toc_bytes), internal_targets, positions
         )
         suffix_bytes = _encode_mobi_text(html_suffix)
         return TextLayout(
@@ -1409,7 +1419,7 @@ class MobiWriter:
         table.extend(b"IDXT")
         for offset in offsets:
             if offset > 0xFFFF:
-                raise ValueError(f"IDXT offset out of range: {offset}")
+                raise _NavigationSizeError(f"IDXT offset out of range: {offset}")
             table.extend(struct.pack(">H", offset))
         pad = len(table) % 4
         if pad:
@@ -1419,6 +1429,8 @@ class MobiWriter:
     def _build_navigation_records(self, layout: TextLayout) -> list[bytes]:
         if len(self.epub.toc_entries) < 2:
             return []
+        if len(self.epub.toc_entries) > 0xFFFF:
+            raise _NavigationSizeError("Logical TOC entry count exceeds single-record limit")
 
         label_record = bytearray()
         label_offsets: list[int] = []
@@ -1429,7 +1441,7 @@ class MobiWriter:
             label_record.extend(label_bytes)
 
         if len(label_record) > 0xFFFF:
-            raise ValueError("CNCX label record exceeds single-record limit")
+            raise _NavigationSizeError("CNCX label record exceeds single-record limit")
 
         entry_offsets: list[int] = []
         entries_blob = bytearray()
@@ -1774,7 +1786,11 @@ class MobiWriter:
                 )
 
         layout = self._build_text_layout()
-        nav_records = self._build_navigation_records(layout)
+        try:
+            nav_records = self._build_navigation_records(layout)
+        except _NavigationSizeError as e:
+            logger.warning("Logical TOC omitted: %s; the inline TOC is retained", e)
+            nav_records = []
         text_bytes = layout.text_bytes
         image_records = list(self.epub.image_records)
         uncompressed_records = self._safe_chunk_bytes(text_bytes, TEXT_RECORD_MAX)
@@ -1901,6 +1917,7 @@ def _log_media_omissions(omissions: tuple[MediaOmission, ...], detailed: bool) -
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     parser = _build_cli_parser()
     args = parser.parse_args(argv)
 
