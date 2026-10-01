@@ -2,6 +2,8 @@
 
 `epub2mobi.py` is a zero-dependency Python tool that converts EPUB files to legacy MOBI6 for older Kindle devices.
 
+Just grab the script, run it from the command line, and breathe new life into an old e-reader.
+
 
 ## Requirements
 
@@ -41,6 +43,7 @@ python3 epub2mobi.py my_book.epub --deploy
 - Omitted media are counted in a warning; `--report-omissions` lists affected resources, source documents, and reasons.
 - Limited layout preservation for common book patterns such as centered headings, right-aligned attributions, scene breaks, and simple tables.
 - A small CSS subset preserves bold, italic, alignment, and paragraph indentation from local stylesheets, XHTML style blocks, and inline styles.
+- Detached text drop caps are joined to their following paragraph when their structure and authored float styles identify an unambiguous initial.
 - Preserves explicit bold, italic, superscript (`sup`), subscript (`sub`), and underline (`u`) markup.
 - PalmDOC compression (type `2`), applied per 4096-byte uncompressed text record.
 - Legacy-compatible body sanitization.
@@ -84,6 +87,10 @@ Selectors are single element names (`p`) or single class names (`.italic`), usin
 Precedence is resolved separately for each property: inline declarations override class rules, which override element rules. Later declarations win ties, with style blocks and linked stylesheets processed in document order. Properties inherit from their parent; `inherit` is also supported explicitly. Semantic tags provide local defaults that CSS can override. Alignment hints from class/ID names or auto margins are used only when no authored alignment applies.
 
 Normal values reset inherited bold/italic formatting. A heading containing a normal-weight reset becomes a paragraph so MOBI's built-in heading bold cannot override it; other text retains its resolved bold formatting. Table header cells containing such resets become ordinary cells.
+
+`float` is inspected only to recognize detached text drop caps, with the same selector and declaration precedence. It does not inherit unless explicitly set to `inherit`; `none`, `initial`, and `unset` clear the hint. A left-floating initial in text-only `div`, `p`, or inline wrappers can be moved into the immediately following prose paragraph. Nested wrappers, an opening quotation mark, combining accents, inline formatting, and fragment/link targets are preserved. The initial becomes ordinary inline text; its oversized decorative layout is discarded.
+
+Normalization requires a lowercase or uncased letter at the start of the continuation. Right floats, substantial text, images, intervening content, uppercase or punctuated continuations, and leading spaces that could separate words are left unchanged. XML newline indentation around the initial and continuation is removed when joining them. Existing initials already inline in a paragraph are preserved. Image-based initials and CSS-generated letters are not reconstructed; general float layout remains unsupported.
 
 Other properties, unsupported values, compound/descendant/ID/pseudo selectors, and entire at-rule blocks are skipped. `@import`, `@media`, and `!important` are unsupported. Stylesheets with a `media` attribute other than empty or `all`, alternate stylesheets, and disabled stylesheets are skipped. This subset does not implement the full CSS cascade or modern EPUB layout.
 
