@@ -13,8 +13,10 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import struct
 import sys
+import tempfile
 import urllib.parse
 import zipfile
 import zlib
@@ -1921,12 +1923,34 @@ class MobiWriter:
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)
 
-        with open(output_file, "wb") as f:
-            f.write(pdb_header)
-            f.write(rec_info)
-            f.write(b"\x00\x00")
-            for rec in records:
-                f.write(rec)
+        # Follow existing output symlinks, as opening the destination did, and
+        # keep the temporary file on the destination's filesystem.
+        output_path = Path(output_file).resolve()
+        try:
+            output_mode = stat.S_IMODE(output_path.stat().st_mode)
+        except FileNotFoundError:
+            output_mode = None
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=output_path.parent,
+                                             prefix=".epub2mobi-", suffix=".tmp", delete=False) as f:
+                temporary_path = Path(f.name)
+                f.write(pdb_header)
+                f.write(rec_info)
+                f.write(b"\x00\x00")
+                for rec in records:
+                    f.write(rec)
+                f.flush()
+            if output_mode is not None:
+                os.chmod(temporary_path, output_mode)
+            os.replace(temporary_path, output_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
 
         logger.info("SUCCESS: Created %s", output_file)
 
