@@ -183,6 +183,7 @@ class EpubData:
     omitted_media: tuple[MediaOmission, ...] = ()
     language: Optional[str] = None
     cover_index: Optional[int] = None  # Zero-based offset among image_records.
+    toc_depths: tuple[int, ...] = ()  # Preorder depths; empty means a flat TOC.
 
 
 @dataclass(frozen=True)
@@ -213,10 +214,24 @@ class TocTarget:
     path: str
     fragment: Optional[str]
     label: str
+    parent: Optional[int] = None  # Index of the parent in this source's target list.
 
 
 class _NavigationSizeError(ValueError):
     """The logical TOC cannot fit the supported single-record layout."""
+
+
+def _toc_parent_indices(depths: tuple[int, ...]) -> list[Optional[int]]:
+    """Validate preorder depths and locate each entry's nearest ancestor."""
+    parents: list[Optional[int]] = []
+    ancestors: list[int] = []
+    for index, depth in enumerate(depths):
+        if not isinstance(depth, int) or depth < 0 or depth > len(ancestors):
+            raise ValueError(f"Invalid TOC depth at entry {index}: {depth}")
+        del ancestors[depth:]
+        parents.append(ancestors[-1] if ancestors else None)
+        ancestors.append(index)
+    return parents
 
 
 def _palm_time_now() -> int:
@@ -594,20 +609,35 @@ def _extract_nav_toc_targets(
 
     toc_targets: list[TocTarget] = []
     nav_base_url = _document_base_url(nav_root, nav_path)
-    for elem in _visible_elements(toc_nav):
-        if elem.tag != "a":
-            continue
+
+    def add_link(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
         raw_href = elem.attrib.get("href")
         if not raw_href:
-            continue
+            return parent
         label = " ".join(_visible_text(elem).split())
         if not label:
-            continue
+            return parent
         resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
         if resolved is None:
-            continue
+            return parent
         target_path, fragment = resolved
-        toc_targets.append(TocTarget(path=target_path, fragment=fragment, label=label))
+        index = len(toc_targets)
+        toc_targets.append(TocTarget(path=target_path, fragment=fragment, label=label, parent=parent))
+        return index
+
+    stack = [(toc_nav, None)]
+    while stack:
+        elem, parent = stack.pop()
+        if _suppressed_element(elem):
+            continue
+        if elem.tag == "a":
+            add_link(elem, parent)
+            continue
+        # The leading link labels this list item; nested lists belong to it.
+        # Non-linked grouping spans leave descendants under the nearest link.
+        link = next((child for child in elem if child.tag == "a"), None) if elem.tag == "li" else None
+        child_parent = add_link(link, parent) if link is not None else parent
+        stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not link)
     return toc_targets
 
 
@@ -640,30 +670,29 @@ def _build_ncx_label_map(
         return []
 
     targets: list[TocTarget] = []
-    for nav_point in ncx_root.iter():
-        if not nav_point.tag.endswith("navPoint"):
-            continue
-
-        src = None
-        label = None
-        for elem in nav_point.iter():
-            if label is None and elem.tag.endswith("text") and elem.text:
-                candidate = " ".join(elem.text.split())
-                if candidate:
-                    label = candidate
-            if src is None and elem.tag.endswith("content"):
-                raw_src = elem.attrib.get("src")
-                if raw_src:
-                    src = raw_src
-
-        if not src or not label:
-            continue
-
-        resolved = _resolve_book_href(ncx_path, src)
-        if resolved is None:
-            continue
-        target_path, fragment = resolved
-        targets.append(TocTarget(path=target_path, fragment=fragment, label=label))
+    stack = [(ncx_root, None)]
+    while stack:
+        elem, parent = stack.pop()
+        child_parent = parent
+        if _strip_ns(elem.tag) == "navPoint":
+            # Only this navPoint's own label/content may describe it. Searching
+            # all descendants can accidentally borrow a nested child's values.
+            nav_label = next((child for child in elem if _strip_ns(child.tag) == "navLabel"), None)
+            label = None
+            if nav_label is not None:
+                for child in nav_label:
+                    candidate = " ".join((child.text or "").split())
+                    if _strip_ns(child.tag) == "text" and candidate:
+                        label = candidate
+                        break
+            content = next((child for child in elem if _strip_ns(child.tag) == "content"), None)
+            src = content.get("src") if content is not None else None
+            resolved = _resolve_book_href(ncx_path, src) if src else None
+            if label and resolved is not None:
+                target_path, fragment = resolved
+                child_parent = len(targets)
+                targets.append(TocTarget(path=target_path, fragment=fragment, label=label, parent=parent))
+        stack.extend((child, child_parent) for child in reversed(list(elem)))
 
     return targets
 
@@ -1435,7 +1464,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             return _CssStyles(item.document, rules)
 
         parts: list[str] = []
-        fallback_toc: list[tuple[str, str, str, int]] = []
+        fallback_toc: list[tuple[str, str, int, int]] = []
         for item in spine_items:
             sanitizer = MinimalHtmlSanitizer(
                 current_path=item.full_path,
@@ -1464,60 +1493,73 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
             if clean:
                 if item.linear:
-                    fallback_toc.append((item.anchor, chapter_title, item.stem, item.index))
+                    fallback_toc.append((item.anchor, chapter_title, item.index, 0))
                 parts.append(clean)
                 parts.append("<mbp:pagebreak/>")
 
-        def resolve_toc_targets(targets: list[TocTarget]) -> tuple[list[tuple[str, str, str, int]], bool]:
-            entries: list[tuple[str, str, str, int]] = []
-            seen_anchors: set[str] = set()
-            unresolved = False
-            for target in targets:
+        def resolve_toc_targets(targets: list[TocTarget], source: str) -> tuple[list[tuple[str, str, int, int]], bool]:
+            entries: list[tuple[str, str, int, int]] = []
+            retained: dict[int, Optional[int]] = {}
+            seen_anchors: set[tuple[str, Optional[int]]] = set()
+            unresolved = 0
+            for index, target in enumerate(targets):
+                parent = retained.get(target.parent)
+                # Children of skipped or duplicate nodes attach to the nearest
+                # retained ancestor, never to the previous unrelated branch.
+                retained[index] = parent
                 anchor = (
                     fragment_anchor_map.get((target.path, target.fragment))
                     if target.fragment else file_anchor_map.get(target.path)
                 )
                 if anchor is None:
-                    unresolved = True
+                    unresolved += 1
                     continue
-                if anchor in seen_anchors:
+                # A book/part heading and its first chapter may share a target.
+                # Keep references in separate branches; deduplicate siblings.
+                if (anchor, parent) in seen_anchors:
                     continue
                 spine_item = next((item for item in spine_items if target.path in item.aliases), None)
                 if spine_item is None:
-                    unresolved = True
+                    unresolved += 1
                     continue
-                seen_anchors.add(anchor)
-                entries.append((anchor, target.label, spine_item.stem, spine_item.index))
-            return entries, unresolved
+                seen_anchors.add((anchor, parent))
+                depth = entries[parent][3] + 1 if parent is not None else 0
+                retained[index] = len(entries)
+                entries.append((anchor, target.label, spine_item.index, depth))
+            if unresolved:
+                logger.warning("%s TOC: skipped %d unresolved destination%s", source, unresolved,
+                               "" if unresolved == 1 else "s")
+            return entries, bool(unresolved)
 
-        nav_toc, nav_incomplete = resolve_toc_targets(nav_targets)
-        ncx_toc, ncx_incomplete = resolve_toc_targets(ncx_targets)
-        # Keep a complete source TOC, even if it intentionally lists fewer chapters.
-        # Replace a partially broken TOC only when another source has more entries.
-        if nav_incomplete:
-            raw_toc = max((nav_toc, ncx_toc, fallback_toc), key=len)
-        elif nav_toc:
-            raw_toc = nav_toc
-        elif ncx_incomplete:
-            raw_toc = max((ncx_toc, fallback_toc), key=len)
+        nav_toc, nav_incomplete = resolve_toc_targets(nav_targets, "EPUB3 nav")
+        ncx_toc, _ = resolve_toc_targets(ncx_targets, "NCX")
+        # Preserve authored TOCs even when some links are stale. A more complete
+        # NCX can replace an incomplete nav; spine guesses are only a last resort.
+        if nav_toc:
+            raw_toc = ncx_toc if nav_incomplete and len(ncx_toc) > len(nav_toc) else nav_toc
         else:
             raw_toc = ncx_toc or fallback_toc
 
-        label_counts: dict[str, int] = {}
-        for _, label, _, _ in raw_toc:
-            label_counts[label] = label_counts.get(label, 0) + 1
+        toc_depths = tuple(depth for _, _, _, depth in raw_toc)
+        parents = _toc_parent_indices(toc_depths)
+        label_counts: dict[tuple[Optional[int], str], int] = {}
+        for (_, label, _, _), parent in zip(raw_toc, parents):
+            key = (parent, label)
+            label_counts[key] = label_counts.get(key, 0) + 1
 
         toc_entries: list[tuple[str, str]] = []
-        used_labels: set[str] = set()
-        for anchor, label, stem, spine_idx in raw_toc:
-            if label_counts[label] > 1:
+        used_labels: set[tuple[Optional[int], str]] = set()
+        for (anchor, label, spine_idx, _), parent in zip(raw_toc, parents):
+            # Repeated labels in different books/sections are already distinct
+            # through their parents; only siblings need disambiguation.
+            if label_counts[(parent, label)] > 1:
                 resolved = f"{label} ({spine_idx})"
             else:
                 resolved = label
 
-            if resolved in used_labels:
+            if (parent, resolved) in used_labels:
                 resolved = f"Chapter {spine_idx}"
-            used_labels.add(resolved)
+            used_labels.add((parent, resolved))
             toc_entries.append((anchor, resolved))
 
         html_content = "".join(parts)
@@ -1532,6 +1574,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             omitted_media=tuple(omissions),
             language=book_language,
             cover_index=cover_index,
+            toc_depths=toc_depths,
         )
 
 
@@ -1800,19 +1843,29 @@ class MobiWriter:
         return anchor_positions
 
     @staticmethod
-    def _build_toc_html(entries: tuple[tuple[str, str], ...], file_positions: list[int]) -> str:
+    def _build_toc_html(entries: tuple[tuple[str, str], ...], file_positions: list[int],
+                        depths: tuple[int, ...] = ()) -> str:
         if len(entries) < 2:
             return ""
         if len(entries) != len(file_positions):
             raise ValueError("TOC entry count does not match filepos count")
+        depths = depths or (0,) * len(entries)
+        if len(depths) != len(entries):
+            raise ValueError("TOC depth count does not match entry count")
+        _toc_parent_indices(depths)
 
         parts = ["<h1>Table of Contents</h1>"]
-        for (_, title), filepos in zip(entries, file_positions):
+        current_depth = 0
+        for (_, title), filepos, depth in zip(entries, file_positions, depths):
             if filepos < 0 or filepos >= TOC_FILEPOS_MAX:
                 raise ValueError(f"TOC filepos out of range: {filepos}")
             safe_title = htmlmod.escape(title, quote=False)
             safe_filepos = f"{filepos:0{TOC_FILEPOS_WIDTH}d}"
+            parts.extend(["</blockquote>"] * max(0, current_depth - depth))
+            parts.extend(["<blockquote>"] * max(0, depth - current_depth))
+            current_depth = depth
             parts.append(f'<p><a filepos="{safe_filepos}">{safe_title}</a></p>')
+        parts.extend(["</blockquote>"] * current_depth)
         parts.append("<mbp:pagebreak/>")
         return "".join(parts)
 
@@ -1835,7 +1888,8 @@ class MobiWriter:
         body_anchor_positions = self._find_anchor_positions(positions)
         provisional_positions = [0] * len(entries)
         # Fixed-width filepos digits keep TOC byte length stable between provisional/final passes.
-        provisional_toc = _encode_mobi_text(MobiWriter._build_toc_html(entries, provisional_positions))
+        provisional_toc = _encode_mobi_text(MobiWriter._build_toc_html(entries, provisional_positions,
+                                                                     self.epub.toc_depths))
         toc_len = len(provisional_toc)
         return [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
 
@@ -1891,7 +1945,8 @@ class MobiWriter:
             toc_prefix_len += len(guide_bytes)
             final_positions = self._compute_toc_positions(toc_prefix_len, positions)
             toc_entry_positions = tuple(final_positions)
-            toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions))
+            toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions,
+                                                                   self.epub.toc_depths))
 
         body_bytes = self._finish_internal_links(
             body_bytes, len(prefix_bytes) + len(guide_bytes) + len(toc_bytes), internal_targets, positions
@@ -1904,14 +1959,18 @@ class MobiWriter:
         )
 
     @staticmethod
-    def _build_tagx() -> bytes:
+    def _build_tagx(nested: bool = False) -> bytes:
         tags = (
             (1, 1, 0x01, 0),
             (2, 1, 0x02, 0),
             (3, 1, 0x04, 0),
             (4, 1, 0x08, 0),
-            (0, 0, 0x00, 1),
         )
+        if nested:
+            # Standard NCX parent/first-child/last-child relationships. Bit
+            # 0x10 is reserved for the class tag used by periodical indexes.
+            tags += ((21, 1, 0x20, 0), (22, 1, 0x40, 0), (23, 1, 0x80, 0))
+        tags += ((0, 0, 0x00, 1),)
         tagx = bytearray()
         tagx.extend(b"TAGX")
         tagx.extend(struct.pack(">I", 12 + (len(tags) * 4)))
@@ -1964,6 +2023,15 @@ class MobiWriter:
             return []
         if len(self.epub.toc_entries) > 0xFFFF:
             raise _NavigationSizeError("Logical TOC entry count exceeds single-record limit")
+        depths = self.epub.toc_depths or (0,) * len(self.epub.toc_entries)
+        if len(depths) != len(self.epub.toc_entries):
+            raise ValueError("TOC depth count does not match entry count")
+        parents = _toc_parent_indices(depths)
+        child_ranges: dict[int, tuple[int, int]] = {}
+        for index, parent in enumerate(parents):
+            if parent is not None:
+                first_child = child_ranges.get(parent, (index, index))[0]
+                child_ranges[parent] = (first_child, index)
 
         label_record = bytearray()
         label_offsets: list[int] = []
@@ -1987,20 +2055,38 @@ class MobiWriter:
             if index + 1 < len(positions_in_text_order) else text_length
             for index, filepos in enumerate(positions_in_text_order)
         }
+        entry_ends = [end_by_position[filepos] for filepos in entry_positions]
+        # A parent spans its descendants too. Flat entries still use the next
+        # physical destination as their boundary, including out-of-order TOCs.
+        for index in range(len(parents) - 1, -1, -1):
+            parent = parents[index]
+            if parent is not None:
+                entry_ends[parent] = max(entry_ends[parent], entry_ends[index])
         for index, ((_, _title), filepos, label_offset) in enumerate(
             zip(self.epub.toc_entries, entry_positions, label_offsets)
         ):
             entry_offsets.append(INDX_HEADER_LEN + len(entries_blob))
             name = f"{index:03d}".encode("ascii")
-            length = max(1, end_by_position[filepos] - filepos)
+            length = max(1, entry_ends[index] - filepos)
 
             entries_blob.append(len(name))
             entries_blob.extend(name)
-            entries_blob.append(0x0F)
+            control = 0x0F
+            if parents[index] is not None:
+                control |= 0x20
+            if index in child_ranges:
+                control |= 0xC0
+            entries_blob.append(control)
             entries_blob.extend(_encode_vwi(filepos))
             entries_blob.extend(_encode_vwi(length))
             entries_blob.extend(_encode_vwi(label_offset))
-            entries_blob.extend(_encode_vwi(0))
+            entries_blob.extend(_encode_vwi(depths[index]))
+            if parents[index] is not None:
+                entries_blob.extend(_encode_vwi(parents[index]))
+            if index in child_ranges:
+                first_child, last_child = child_ranges[index]
+                entries_blob.extend(_encode_vwi(first_child))
+                entries_blob.extend(_encode_vwi(last_child))
 
         secondary_idxt = self._build_idxt(entry_offsets)
         secondary_header = self._build_indx_header(
@@ -2013,8 +2099,10 @@ class MobiWriter:
             unk1=1,
         )
         secondary_record = secondary_header + bytes(entries_blob) + secondary_idxt
+        if len(secondary_record) > 0x10000:
+            raise _NavigationSizeError("INDX navigation record exceeds single-record limit")
 
-        tagx = self._build_tagx()
+        tagx = self._build_tagx(nested=any(depths))
         last_name = f"{len(self.epub.toc_entries) - 1:03d}".encode("ascii")
         main_dummy = bytes((len(last_name),)) + last_name
         main_dummy += struct.pack(">H", len(self.epub.toc_entries))
