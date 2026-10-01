@@ -71,6 +71,10 @@ EXTH_TITLE = 503
 EXTH_SOURCE = 112
 EXTH_ASIN = 113
 EXTH_CDETYPE = 501  # EBOK/PDOC
+EXTH_COVER_OFFSET = 201
+
+DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
+OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
 
 # MOBI Header Offsets (Relative to MOBI Magic)
 OFF_LENGTH = 0x04
@@ -150,6 +154,7 @@ class EpubData:
     image_records: tuple[bytes, ...] = ()
     omitted_media: tuple[MediaOmission, ...] = ()
     language: Optional[str] = None
+    cover_index: Optional[int] = None  # Zero-based offset among image_records.
 
 
 @dataclass(frozen=True)
@@ -684,6 +689,69 @@ def _read_xml_member(z: zipfile.ZipFile, member_path: str) -> bytes:
     return data
 
 
+def _marc_creator_role(value: str) -> Optional[str]:
+    value = value.strip().lower()
+    for prefix in ("http://id.loc.gov/vocabulary/relators/", "https://id.loc.gov/vocabulary/relators/"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    return value if re.fullmatch(r"[a-z]{3}", value) else None
+
+
+def _metadata_author(metadata: list[ET.Element]) -> str:
+    refined_roles: dict[str, set[str]] = {}
+    for elem in metadata:
+        if (elem.tag not in {OPF_NAMESPACE + "meta", "meta"}
+                or elem.get("property") != "role"
+                or elem.get("scheme", "marc:relators") != "marc:relators"):
+            continue
+        refines = elem.get("refines", "")
+        role = _marc_creator_role(elem.text or "")
+        if refines.startswith("#") and role:
+            refined_roles.setdefault(urllib.parse.unquote(refines[1:]), set()).add(role)
+
+    creators: list[str] = []
+    authors: list[str] = []
+    for elem in metadata:
+        if elem.tag != DC_NAMESPACE + "creator":
+            continue
+        name = (elem.text or "").strip()
+        if not name:
+            continue
+        creators.append(name)
+        roles = set(refined_roles.get(elem.get("id", ""), ()))
+        legacy_role = _marc_creator_role(elem.get(OPF_NAMESPACE + "role", ""))
+        if legacy_role:
+            roles.add(legacy_role)
+        if not roles or "aut" in roles:
+            authors.append(name)
+    if authors:
+        return "; ".join(authors)
+    if creators:
+        logger.warning("No author or untyped creator found; using all creator credits as author metadata")
+        return "; ".join(creators)
+    return "Unknown"
+
+
+def _declared_cover_item(metadata: list[ET.Element], manifest_properties: dict[str, str]) -> Optional[str]:
+    for item_id, properties in manifest_properties.items():
+        if "cover-image" in properties.split():
+            return item_id
+    for elem in metadata:
+        if elem.tag in {OPF_NAMESPACE + "meta", "meta"} and elem.get("name") == "cover":
+            item_id = elem.get("content", "").strip()
+            if item_id:
+                return item_id
+    return None
+
+
+def _raster_signature_matches(data: bytes, media_type: str) -> bool:
+    signatures = {"image/jpeg": (b"\xff\xd8\xff",),
+                  "image/png": (b"\x89PNG\r\n\x1a\n",),
+                  "image/gif": (b"GIF87a", b"GIF89a")}
+    return data.startswith(signatures.get(media_type.lower(), ()))
+
+
 def parse_epub(filepath: Union[str, Path]) -> EpubData:
     filepath = Path(filepath)
     if not filepath.exists():
@@ -706,21 +774,17 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         fallback_uuid = None
         chosen_uuid = None
 
-        metadata = next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ())
+        metadata = list(next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ()))
         titles: list[str] = []
-        creators: list[str] = []
-        dc_namespace = "{http://purl.org/dc/elements/1.1/}"
         for elem in metadata:
             value = (elem.text or "").strip()
             if not value:
                 continue
-            if elem.tag == dc_namespace + "title":
+            if elem.tag == DC_NAMESPACE + "title":
                 titles.append(value)
-            elif elem.tag == dc_namespace + "creator":
-                creators.append(value)
-            elif elem.tag == dc_namespace + "language" and not book_language:
+            elif elem.tag == DC_NAMESPACE + "language" and not book_language:
                 book_language = value
-            elif elem.tag == dc_namespace + "identifier":
+            elif elem.tag == DC_NAMESPACE + "identifier":
                 ident = value
                 if ident and not fallback_uuid:
                     fallback_uuid = ident
@@ -729,8 +793,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
 
         if titles:
             book_title = titles[0]
-        if creators:
-            book_author = "; ".join(creators)
+        book_author = _metadata_author(metadata)
         if chosen_uuid:
             book_uuid = chosen_uuid
         elif fallback_uuid:
@@ -916,6 +979,40 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
 
         image_path_to_recindex: dict[str, int] = {}
         image_records: list[bytes] = []
+
+        def embed_image(target_path: str, source: str, item_id: Optional[str] = None,
+                        *, cover: bool = False) -> Optional[int]:
+            nonlocal extracted_resource_bytes
+            item_id = item_id if item_id is not None else manifest_paths.get(target_path)
+            if item_id is None:
+                record_omission(target_path, source, "image is not declared in the EPUB manifest")
+                return None
+            media_type = manifest_media_types.get(item_id, "")
+            if not _is_supported_image_media_type(media_type):
+                record_omission(target_path, source, f"unsupported image format: {media_type or 'unspecified'}")
+                return None
+            recindex = image_path_to_recindex.get(target_path)
+            if recindex is not None:
+                image_data = image_records[recindex - 1]
+            else:
+                try:
+                    image_data, extracted_resource_bytes = _read_zip_member(
+                        z, target_path, size_limit=MAX_IMAGE_BYTES,
+                        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+                        aggregate_used=extracted_resource_bytes, kind="Image resource",
+                    )
+                except KeyError:
+                    record_omission(target_path, source, "image file is missing from the EPUB")
+                    return None
+            if cover and not _raster_signature_matches(image_data, media_type):
+                record_omission(target_path, source, "cover image signature does not match its declared raster format")
+                return None
+            if recindex is None:
+                image_records.append(image_data)
+                recindex = len(image_records)
+                image_path_to_recindex[target_path] = recindex
+            return recindex
+
         for item in spine_items:
             image_sources, unsupported, inline_svg = _media_references(item.body)
             if inline_svg and item.full_path not in svg_spine_paths:
@@ -934,30 +1031,23 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     record_omission(resource, item.full_path, "external or data URI image is not embedded")
                     continue
                 target_path, _fragment = resolved
-                if target_path in image_path_to_recindex:
-                    continue
-                item_id = manifest_paths.get(target_path)
-                if item_id is None:
-                    record_omission(target_path, item.full_path, "image is not declared in the EPUB manifest")
-                    continue
-                media_type = manifest_media_types.get(item_id, "")
-                if not _is_supported_image_media_type(media_type):
-                    record_omission(target_path, item.full_path, f"unsupported image format: {media_type or 'unspecified'}")
-                    continue
-                try:
-                    image_data, extracted_resource_bytes = _read_zip_member(
-                        z,
-                        target_path,
-                        size_limit=MAX_IMAGE_BYTES,
-                        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-                        aggregate_used=extracted_resource_bytes,
-                        kind="Image resource",
-                    )
-                except KeyError:
-                    record_omission(target_path, item.full_path, "image file is missing from the EPUB")
-                    continue
-                image_records.append(image_data)
-                image_path_to_recindex[target_path] = len(image_records)
+                embed_image(target_path, item.full_path)
+
+        cover_index = None
+        cover_id = _declared_cover_item(metadata, manifest_properties)
+        if cover_id is not None:
+            cover_href = manifest.get(cover_id)
+            if cover_href is None:
+                record_omission(cover_id, opf_path, "cover item is not declared in the EPUB manifest")
+            else:
+                resolved = _resolve_book_href(opf_path, cover_href)
+                if resolved is None:
+                    record_omission(_reported_media_path(opf_path, cover_href, cover_href),
+                                    opf_path, "external or data URI cover is not embedded")
+                else:
+                    recindex = embed_image(resolved[0], opf_path, cover_id, cover=True)
+                    if recindex is not None:
+                        cover_index = recindex - 1
 
         parts: list[str] = []
         fallback_toc: list[tuple[str, str, str, int]] = []
@@ -1054,6 +1144,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             image_records=tuple(image_records),
             omitted_media=tuple(omissions),
             language=book_language,
+            cover_index=cover_index,
         )
 
 
@@ -1631,6 +1722,10 @@ class MobiWriter:
 
         asin = f"B{_crc32_u32(self.epub.uuid):08X}".encode("ascii")
         add(EXTH_ASIN, asin)
+        if self.epub.cover_index is not None:
+            if not 0 <= self.epub.cover_index < len(self.epub.image_records):
+                raise ValueError("Cover index is outside the MOBI image records")
+            add(EXTH_COVER_OFFSET, struct.pack(">I", self.epub.cover_index))
 
         exth_len = 12 + len(payload)
         exth = bytearray()
