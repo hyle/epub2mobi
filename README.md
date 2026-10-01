@@ -10,7 +10,13 @@ Just grab the script, run it from the command line, and breathe new life into an
 - Python 3.9+
 
 
-## CLI Usage
+## Install and simple CLI usage
+
+Download the script:
+
+```bash
+curl -fL https://raw.githubusercontent.com/hyle/epub2mobi/main/epub2mobi.py -o epub2mobi.py
+```
 
 Convert:
 
@@ -50,7 +56,7 @@ python3 epub2mobi.py my_book.epub --deploy
 - Optional USB deploy to Kindle `documents` folder (`--deploy`).
 
 
-## Advanced CLI Usage
+## Advanced CLI usage
 
 Choose an output path with `-o` or `--output`:
 
@@ -95,7 +101,7 @@ Normalization requires a lowercase or uncased letter at the start of the continu
 Other properties, unsupported values, compound/descendant/ID/pseudo selectors, and entire at-rule blocks are skipped. `@import`, `@media`, and `!important` are unsupported. Stylesheets with a `media` attribute other than empty or `all`, alternate stylesheets, and disabled stylesheets are skipped. This subset does not implement the full CSS cascade or modern EPUB layout.
 
 
-## Scope and Limitations
+## Scope and limitations
 
 - Output target is MOBI6 (not AZW3/KF8).
 - Text-first conversion: advanced CSS, JavaScript, embedded fonts, SVG, fixed layout, and full modern EPUB styling are not preserved.
