@@ -57,7 +57,7 @@ EXTH_MAGIC = b"EXTH"
 # Encoding: Force CP1252 for Old Kindle Compatibility
 MOBI_TEXT_ENCODING_ID = 1252        # Windows-1252
 MOBI_TEXT_ENCODING_PY = "cp1252"    # Python codec name
-HTML_META_CHARSET = "windows-1252"
+MOBI_TEXT_ENCODING_NAME = "windows-1252"
 
 # TOC filepos field width
 TOC_FILEPOS_WIDTH = 10
@@ -189,7 +189,6 @@ class EpubData:
 @dataclass(frozen=True)
 class SpineItem:
     index: int
-    href: str
     full_path: str
     aliases: tuple[str, ...]
     base_url: str
@@ -197,7 +196,6 @@ class SpineItem:
     stem: str
     document: ET.Element
     body: ET.Element
-    body_fragments: tuple[str, ...]
     fragment_anchors: dict[str, str]
     linear: bool
 
@@ -205,8 +203,8 @@ class SpineItem:
 @dataclass(frozen=True)
 class TextLayout:
     text_bytes: bytes
-    toc_filepos: Optional[int]
     toc_entry_positions: tuple[int, ...]
+    body_end: int  # Excludes the generated TOC and closing HTML tags.
 
 
 @dataclass(frozen=True)
@@ -1310,7 +1308,6 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
             spine_items.append(
                 SpineItem(
                     index=spine_idx,
-                    href=rel,
                     full_path=full,
                     aliases=aliases,
                     base_url=_document_base_url(document, full),
@@ -1318,7 +1315,6 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                     stem=Path(rel).stem,
                     document=document,
                     body=body,
-                    body_fragments=body_fragments,
                     fragment_anchors=fragment_anchors,
                     linear=linear,
                 )
@@ -1866,7 +1862,6 @@ class MobiWriter:
             current_depth = depth
             parts.append(f'<p><a filepos="{safe_filepos}">{safe_title}</a></p>')
         parts.extend(["</blockquote>"] * current_depth)
-        parts.append("<mbp:pagebreak/>")
         return "".join(parts)
 
     @staticmethod
@@ -1879,19 +1874,6 @@ class MobiWriter:
             f'<reference type="toc" title="Table of Contents" filepos="{safe_filepos}"/>'
             "</guide>"
         )
-
-    def _compute_toc_positions(self, html_prefix_len: int, positions: dict[bytes, int]) -> list[int]:
-        entries = self.epub.toc_entries
-        if len(entries) < 2:
-            return []
-
-        body_anchor_positions = self._find_anchor_positions(positions)
-        provisional_positions = [0] * len(entries)
-        # Fixed-width filepos digits keep TOC byte length stable between provisional/final passes.
-        provisional_toc = _encode_mobi_text(MobiWriter._build_toc_html(entries, provisional_positions,
-                                                                     self.epub.toc_depths))
-        toc_len = len(provisional_toc)
-        return [html_prefix_len + toc_len + pos for pos in body_anchor_positions]
 
     @staticmethod
     def _prepare_internal_links(body_bytes: bytes, positions: dict[bytes, int]) -> tuple[bytes, list[bytes]]:
@@ -1920,14 +1902,9 @@ class MobiWriter:
         return re.sub(rb'(<a\b[^>]*?) filepos="\?{10}"', replace, body_bytes)
 
     def _build_text_layout(self) -> TextLayout:
-        html_prefix = (
-            "<html><head>"
-            f'<meta http-equiv="Content-Type" content="text/html; charset={HTML_META_CHARSET}"/>'
-            "</head><body>"
-        )
-        html_suffix = "</body></html>"
-
-        prefix_bytes = _encode_mobi_text(html_prefix)
+        # The MOBI header declares the encoding. An HTML charset declaration
+        # becomes stale when browser readers reserialize the decoded DOM as UTF-8.
+        prefix_bytes = b"<html><head></head><body>"
         body_bytes = _encode_mobi_text(self.epub.html_content)
         body_bytes, internal_targets = self._prepare_internal_links(body_bytes, self._anchor_positions(body_bytes))
         # Replacements change byte offsets. Scan once more, then share these
@@ -1935,27 +1912,27 @@ class MobiWriter:
         positions = self._anchor_positions(body_bytes)
         guide_bytes = b""
         toc_bytes = b""
-        toc_filepos = None
+        toc_separator = b""
         toc_entry_positions: tuple[int, ...] = ()
-        toc_prefix_len = len(prefix_bytes)
+        body_start = len(prefix_bytes)
         if len(self.epub.toc_entries) >= 2:
-            provisional_guide = _encode_mobi_text(MobiWriter._build_guide_html(0))
-            toc_filepos = len(prefix_bytes) + len(provisional_guide)
-            guide_bytes = _encode_mobi_text(MobiWriter._build_guide_html(toc_filepos))
-            toc_prefix_len += len(guide_bytes)
-            final_positions = self._compute_toc_positions(toc_prefix_len, positions)
+            # Fixed-width guide digits keep the body offset independent of
+            # the TOC's destination at the end of the book.
+            body_start += len(_encode_mobi_text(self._build_guide_html(0)))
+            final_positions = [body_start + pos for pos in self._find_anchor_positions(positions)]
             toc_entry_positions = tuple(final_positions)
-            toc_bytes = _encode_mobi_text(MobiWriter._build_toc_html(self.epub.toc_entries, final_positions,
-                                                                   self.epub.toc_depths))
+            toc_bytes = _encode_mobi_text(self._build_toc_html(self.epub.toc_entries, final_positions,
+                                                              self.epub.toc_depths))
+            if not body_bytes.rstrip().endswith(b"<mbp:pagebreak/>"):
+                toc_separator = b"<mbp:pagebreak/>"
+            toc_filepos = body_start + len(body_bytes) + len(toc_separator)
+            guide_bytes = _encode_mobi_text(self._build_guide_html(toc_filepos))
 
-        body_bytes = self._finish_internal_links(
-            body_bytes, len(prefix_bytes) + len(guide_bytes) + len(toc_bytes), internal_targets, positions
-        )
-        suffix_bytes = _encode_mobi_text(html_suffix)
+        body_bytes = self._finish_internal_links(body_bytes, body_start, internal_targets, positions)
         return TextLayout(
-            text_bytes=prefix_bytes + guide_bytes + toc_bytes + body_bytes + suffix_bytes,
-            toc_filepos=toc_filepos,
+            text_bytes=prefix_bytes + guide_bytes + body_bytes + toc_separator + toc_bytes + b"</body></html>",
             toc_entry_positions=toc_entry_positions,
+            body_end=body_start + len(body_bytes),
         )
 
     @staticmethod
@@ -2047,12 +2024,11 @@ class MobiWriter:
         entry_offsets: list[int] = []
         entries_blob = bytearray()
         entry_positions = list(layout.toc_entry_positions)
-        text_length = len(layout.text_bytes)
         # Auxiliary spine items can put TOC order out of physical text order.
         positions_in_text_order = sorted(set(entry_positions))
         end_by_position = {
             filepos: positions_in_text_order[index + 1]
-            if index + 1 < len(positions_in_text_order) else text_length
+            if index + 1 < len(positions_in_text_order) else layout.body_end
             for index, filepos in enumerate(positions_in_text_order)
         }
         entry_ends = [end_by_position[filepos] for filepos in entry_positions]
@@ -2407,7 +2383,7 @@ class MobiWriter:
                 logger.warning(
                     "%s contains characters outside %s; MOBI metadata will replace them with '?'",
                     field_name,
-                    HTML_META_CHARSET,
+                    MOBI_TEXT_ENCODING_NAME,
                 )
 
         layout = self._build_text_layout()
