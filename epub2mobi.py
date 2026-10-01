@@ -29,10 +29,11 @@ import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime
 from html.entities import name2codepoint
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import BinaryIO, Iterator, Optional, Tuple, Union
 
 # --- LOGGING ---
 logger = logging.getLogger("epub2mobi")
@@ -778,14 +779,19 @@ def _css_value(property_name: str, value: str) -> Optional[str]:
     return None
 
 
-def _css_declarations(text: str) -> dict[str, str]:
-    declarations: dict[str, str] = {}
+def _css_declaration_values(text: str):
+    """Yield declaration names and raw values outside comments and strings."""
     for declaration, _ in _css_parts(text, ";"):
         parts = list(_css_parts(declaration, ":"))
         if len(parts) != 2 or parts[0][1] != ":":
             continue
-        name = parts[0][0].strip().lower()
-        value = _css_value(name, parts[1][0])
+        yield parts[0][0].strip().lower(), parts[1][0].strip()
+
+
+def _css_declarations(text: str) -> dict[str, str]:
+    declarations: dict[str, str] = {}
+    for name, raw_value in _css_declaration_values(text):
+        value = _css_value(name, raw_value)
         if value is not None:
             declarations[name] = value
     return declarations
@@ -883,6 +889,19 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
     wrappers = {"div", "p", "span", "b", "i", "strong", "em", "u", "a"}
     inline = wrappers - {"div", "p"} | {"sup", "sub", "code"}
     opening_quotes = frozenset("\"'\u2018\u201c\u00ab\u2039\u201e\u201a")
+    xml_whitespace = " \t\r\n"
+
+    def initial_layout_text(text: str) -> Optional[str]:
+        stripped = text.strip(xml_whitespace)
+        if any(char.isspace() for char in stripped):
+            return None
+        prefix = text[:len(text) - len(text.lstrip(xml_whitespace))]
+        suffix = text[len(text.rstrip(xml_whitespace)):]
+        # Only newline indentation can be safely removed. Explicit spaces and
+        # all non-XML whitespace may separate words, even inside the initial.
+        if any(part and "\n" not in part and "\r" not in part for part in (prefix, suffix)):
+            return None
+        return stripped
 
     def is_initial(elem: ET.Element) -> bool:
         elements = list(elem.iter())
@@ -891,6 +910,12 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
         floats = {styles.floats.get(node, "none") for node in elements}
         if "left" not in floats or "right" in floats:
             return False
+        for node in elements:
+            texts = [node.text or ""]
+            if node is not elem:
+                texts.append(node.tail or "")
+            if any(initial_layout_text(text) is None for text in texts):
+                return False
         text = "".join("".join(elem.itertext()).split())
         if text and text[0] in opening_quotes:
             text = text[1:]
@@ -899,7 +924,7 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
 
     def continuation_start(elem: ET.Element) -> Optional[str]:
         def first(text: str) -> Optional[str]:
-            stripped = text.lstrip()
+            stripped = text.lstrip(xml_whitespace)
             prefix = text[:len(text) - len(stripped)]
             # Newline indentation is XML formatting; a plain leading space may
             # separate a one-letter word ("A dog") and must not be discarded.
@@ -924,14 +949,14 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
 
     def trim_start(elem: ET.Element) -> bool:
         if elem.text:
-            elem.text = elem.text.lstrip()
+            elem.text = elem.text.lstrip(xml_whitespace)
             if elem.text:
                 return True
         for child in elem:
             if not _suppressed_element(child) and trim_start(child):
                 return True
             if child.tail:
-                child.tail = child.tail.lstrip()
+                child.tail = child.tail.lstrip(xml_whitespace)
                 if child.tail:
                     return True
         return False
@@ -941,7 +966,7 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
             return
         children = list(parent)
         for initial, paragraph in zip(children, children[1:]):
-            if (paragraph.tag != "p" or (initial.tail or "").strip()
+            if (paragraph.tag != "p" or (initial.tail or "").strip(xml_whitespace)
                     or styles.floats.get(paragraph, "none") != "none"
                     or MinimalHtmlSanitizer._tokenize_hints(paragraph.get("class", ""), paragraph.get("id", ""))
                     & MinimalHtmlSanitizer._HEADING_HINTS
@@ -955,9 +980,9 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
                 if node.tag in {"div", "p"}:
                     node.tag = "span"
                 if node.text:
-                    node.text = "".join(node.text.split())
+                    node.text = initial_layout_text(node.text)
                 if node is not initial and node.tail:
-                    node.tail = "".join(node.tail.split())
+                    node.tail = initial_layout_text(node.tail)
             trim_start(paragraph)
             parent.remove(initial)
             initial.tail = paragraph.text
@@ -1567,8 +1592,11 @@ class MinimalHtmlSanitizer:
 
     @staticmethod
     def _derive_alignment(style: str, hint_tokens: set[str]) -> Optional[str]:
-        normalized = style.lower().replace(" ", "")
-        if "margin-left:auto" in normalized and "margin-right:auto" in normalized:
+        # This is a fallback hint, not margin layout: require the final complete
+        # value on each side to be exactly auto, without interpreting lengths.
+        margins = {name: value.lower() for name, value in _css_declaration_values(style)
+                   if name in {"margin-left", "margin-right"}}
+        if margins.get("margin-left") == margins.get("margin-right") == "auto":
             return "center"
         if hint_tokens & MinimalHtmlSanitizer._CENTER_HINTS:
             return "center"
@@ -1695,6 +1723,35 @@ class MinimalHtmlSanitizer:
             self.fed.append("\n" if tag in {"tr", "table"} else " ")
         elif tag in self._FLATTENED_BLOCKS:
             self._ensure_block_sep()
+
+
+@contextmanager
+def _atomic_output(output_file: Union[str, Path]) -> Iterator[BinaryIO]:
+    """Close a complete temporary file before replacing the destination."""
+    # Preserve existing symlink targets and keep the temporary file on the
+    # destination's filesystem, for both conversion and USB deployment.
+    output_path = Path(output_file).resolve()
+    try:
+        output_mode = stat.S_IMODE(output_path.stat().st_mode)
+    except FileNotFoundError:
+        output_mode = None
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=output_path.parent,
+                                         prefix=".epub2mobi-", suffix=".tmp", delete=False) as f:
+            temporary_path = Path(f.name)
+            yield f
+            f.flush()
+        if output_mode is not None:
+            os.chmod(temporary_path, output_mode)
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class MobiWriter:
@@ -2283,34 +2340,12 @@ class MobiWriter:
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)
 
-        # Follow existing output symlinks, as opening the destination did, and
-        # keep the temporary file on the destination's filesystem.
-        output_path = Path(output_file).resolve()
-        try:
-            output_mode = stat.S_IMODE(output_path.stat().st_mode)
-        except FileNotFoundError:
-            output_mode = None
-        temporary_path = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="wb", dir=output_path.parent,
-                                             prefix=".epub2mobi-", suffix=".tmp", delete=False) as f:
-                temporary_path = Path(f.name)
-                f.write(pdb_header)
-                f.write(rec_info)
-                f.write(b"\x00\x00")
-                for rec in records:
-                    f.write(rec)
-                f.flush()
-            if output_mode is not None:
-                os.chmod(temporary_path, output_mode)
-            os.replace(temporary_path, output_path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
+        with _atomic_output(output_file) as f:
+            f.write(pdb_header)
+            f.write(rec_info)
+            f.write(b"\x00\x00")
+            for rec in records:
+                f.write(rec)
 
         logger.info("SUCCESS: Created %s", output_file)
 
@@ -2341,14 +2376,14 @@ def deploy_to_kindle(source_file: str) -> None:
             continue
         if "Kindle" not in os.path.basename(path) and not os.path.exists(os.path.join(path, "system")):
             continue
-        try:
-            dest = os.path.join(docs, os.path.basename(source_file))
-            shutil.copy2(source_file, dest)
-            logger.info("Copied to Kindle: %s", dest)
-            return
-        except Exception as e:
-            logger.error("Copy failed: %s", e)
-            return
+        dest = os.path.join(docs, os.path.basename(source_file))
+        # Actual copy failures propagate to main(), which returns a failure
+        # status. The completed local conversion remains available for retry.
+        with _atomic_output(dest) as destination:
+            with open(source_file, "rb") as source:
+                shutil.copyfileobj(source, destination)
+        logger.info("Copied to Kindle: %s", dest)
+        return
 
     logger.warning("No Kindle detected.")
 
