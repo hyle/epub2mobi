@@ -40,6 +40,7 @@ python3 epub2mobi.py my_book.epub --deploy
 - Declared local raster covers are embedded even when no spine page references them, and identified through MOBI EXTH 201. EPUB3 `cover-image` declarations take precedence over EPUB2 `<meta name="cover">`; referenced cover images are reused.
 - Omitted media are counted in a warning; `--report-omissions` lists affected resources, source documents, and reasons.
 - Limited layout preservation for common book patterns such as centered headings, right-aligned attributions, scene breaks, and simple tables.
+- A small CSS subset preserves bold, italic, alignment, and paragraph indentation from local stylesheets, XHTML style blocks, and inline styles.
 - Preserves explicit bold, italic, superscript (`sup`), subscript (`sub`), and underline (`u`) markup.
 - PalmDOC compression (type `2`), applied per 4096-byte uncompressed text record.
 - Legacy-compatible body sanitization.
@@ -56,20 +57,42 @@ python3 epub2mobi.py my_book.epub -o converted.mobi
 
 The output path cannot resolve to the input EPUB.
 
+Output is written to a temporary file in the destination directory, flushed and closed, then replaced atomically. Failed writes leave existing output intact and remove the temporary file. Existing output permissions and symlink targets are preserved; new files use the temporary file's private permissions.
+
 To see which media were omitted:
 
 ```bash
 python3 epub2mobi.py my_book.epub --report-omissions
 ```
 
-The report covers declared covers, referenced images, inline SVG, audio/video, embedded objects in spine content, fonts declared in the manifest, and remote manifest resources. Remote resources are not downloaded; local text conversion continues. The converter shows a one-line warning when it detects omissions even without the option.
+The report covers declared covers, referenced images, inline SVG, audio/video, embedded objects in spine content, fonts declared in the manifest, remote manifest resources, and missing, remote, or incorrectly encoded linked stylesheets. Remote resources are not downloaded; local text conversion continues. The converter shows a one-line warning when it detects omissions even without the option.
+
+
+## Supported CSS
+
+Styles come from XHTML `<style>` blocks, local `<link rel="stylesheet">` resources, and inline `style` attributes. Linked stylesheets must use UTF-8 (an optional BOM is accepted); relative paths honor the document's `base` URL. Stylesheets are read once per resource and limited to 1 MiB each, within the shared content size budget. Oversized stylesheets reject conversion. Missing, remote, or non-UTF-8 stylesheets are skipped and reported.
+
+Selectors are single element names (`p`) or single class names (`.italic`), using ASCII identifiers. Class names are case-sensitive. Comma-separated lists are supported when every selector in the list is supported.
+
+| Property | Supported values | MOBI output |
+| --- | --- | --- |
+| `font-style` | `normal`, `italic`, `oblique` | Italic markup; `oblique` becomes italic |
+| `font-weight` | `normal`, `bold`, `100` through `900` in steps of 100 | Bold markup for weights 600–900 |
+| `text-align` | `left`, `right`, `center`, `justify` | Block `align` attribute |
+| `text-indent` | `0`, nonnegative lengths in `em` or `pt` | `width` attribute on paragraphs, divisions, blockquotes, and headings |
+
+Precedence is resolved separately for each property: inline declarations override class rules, which override element rules. Later declarations win ties, with style blocks and linked stylesheets processed in document order. Properties inherit from their parent; `inherit` is also supported explicitly. Semantic tags provide local defaults that CSS can override. Alignment hints from class/ID names or auto margins are used only when no authored alignment applies.
+
+Normal values reset inherited bold/italic formatting. A heading containing a normal-weight reset becomes a paragraph so MOBI's built-in heading bold cannot override it; other text retains its resolved bold formatting. Table header cells containing such resets become ordinary cells.
+
+Other properties, unsupported values, compound/descendant/ID/pseudo selectors, and entire at-rule blocks are skipped. `@import`, `@media`, and `!important` are unsupported. Stylesheets with a `media` attribute other than empty or `all`, alternate stylesheets, and disabled stylesheets are skipped. This subset does not implement the full CSS cascade or modern EPUB layout.
 
 
 ## Scope and Limitations
 
 - Output target is MOBI6 (not AZW3/KF8).
 - Text-first conversion: advanced CSS, JavaScript, embedded fonts, SVG, fixed layout, and full modern EPUB styling are not preserved.
-- Layout preservation is intentionally narrow and heuristic-based, not a general CSS engine.
+- Layout preservation uses the CSS subset above and a few common class/ID hints; complex CSS layout is not supported.
 - Logical TOCs that exceed the supported single-record size limits are omitted with a warning; the inline TOC and its links remain available.
 - Tables are preserved only when they are simple rectangular structures; complex tables are flattened while retaining their text.
 - Unsupported or missing images are skipped without failing the conversion.
