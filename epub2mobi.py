@@ -18,6 +18,7 @@ import struct
 import sys
 import tempfile
 import urllib.parse
+import unicodedata
 import zipfile
 import zlib
 # ElementTree is used to keep the converter dependency-free.
@@ -743,6 +744,12 @@ def _css_parts(text: str, separators: str):
 
 def _css_value(property_name: str, value: str) -> Optional[str]:
     value = value.strip().lower()
+    # Float is inspected only to recognize detached text initials, not rendered.
+    if property_name == "float":
+        if value in {"left", "right", "none", "inherit"}:
+            return value
+        if value in {"initial", "unset"}:
+            return "none"
     if value == "inherit" and property_name in {"font-style", "font-weight", "text-align", "text-indent"}:
         return value
     if property_name == "font-style" and value in {"normal", "italic", "oblique"}:
@@ -814,7 +821,7 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
 
 
 class _CssStyles:
-    """Resolve just the four supported inherited properties per document."""
+    """Resolve supported text properties and a non-inherited drop-cap float hint."""
 
     def __init__(self, document: ET.Element, rules: list[tuple[str, dict[str, str]]]):
         by_selector: dict[str, dict[str, tuple[int, str]]] = {}
@@ -822,9 +829,10 @@ class _CssStyles:
             target = by_selector.setdefault(selector, {})
             target.update((name, (order, value)) for name, value in declarations.items())
         self.styles: dict[ET.Element, dict[str, str]] = {}
+        self.floats: dict[ET.Element, str] = {}
         self.font_runs = False
 
-        def resolve(elem: ET.Element, parent: dict[str, str]) -> None:
+        def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none") -> None:
             if _suppressed_element(elem):
                 return
             chosen = {name: (0, order, value)
@@ -836,6 +844,10 @@ class _CssStyles:
                         chosen[name] = candidate
             local = {name: value for name, (_, _, value) in chosen.items()}
             local.update(_css_declarations(elem.get("style", "")))
+            floating = local.pop("float", "none")
+            if floating == "inherit":
+                floating = parent_float
+            self.floats[elem] = floating
             self.font_runs |= bool(local.keys() & {"font-style", "font-weight"})
             style = dict(parent)
             # Semantic markup provides local defaults, which authored CSS can reset.
@@ -854,9 +866,107 @@ class _CssStyles:
                     style[name] = value
             self.styles[elem] = style
             for child in elem:
-                resolve(child, style)
+                resolve(child, style, floating)
 
         resolve(document, {})
+
+
+def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
+    """Join unambiguous floated text initials to the following prose paragraph.
+
+    Keep element identities so the precomputed formatting and fragment maps
+    survive the move. Only whitespace and block boundaries around the initial
+    are removed; its inline markup remains intact.
+    """
+    if "left" not in styles.floats.values():
+        return
+    wrappers = {"div", "p", "span", "b", "i", "strong", "em", "u", "a"}
+    inline = wrappers - {"div", "p"} | {"sup", "sub", "code"}
+    opening_quotes = frozenset("\"'\u2018\u201c\u00ab\u2039\u201e\u201a")
+
+    def is_initial(elem: ET.Element) -> bool:
+        elements = list(elem.iter())
+        if any(node.tag not in wrappers for node in elements):
+            return False
+        floats = {styles.floats.get(node, "none") for node in elements}
+        if "left" not in floats or "right" in floats:
+            return False
+        text = "".join("".join(elem.itertext()).split())
+        if text and text[0] in opening_quotes:
+            text = text[1:]
+        return bool(text and text[0].isalpha()
+                    and all(unicodedata.category(char).startswith("M") for char in text[1:]))
+
+    def continuation_start(elem: ET.Element) -> Optional[str]:
+        def first(text: str) -> Optional[str]:
+            stripped = text.lstrip()
+            prefix = text[:len(text) - len(stripped)]
+            # Newline indentation is XML formatting; a plain leading space may
+            # separate a one-letter word ("A dog") and must not be discarded.
+            if prefix and "\n" not in prefix and "\r" not in prefix:
+                return None
+            return stripped[:1]
+
+        start = first(elem.text or "")
+        if start is None or start:
+            return start
+        for child in elem:
+            if not _suppressed_element(child):
+                if child.tag not in inline:
+                    return None
+                start = continuation_start(child)
+                if start is None or start:
+                    return start
+            start = first(child.tail or "")
+            if start is None or start:
+                return start
+        return ""
+
+    def trim_start(elem: ET.Element) -> bool:
+        if elem.text:
+            elem.text = elem.text.lstrip()
+            if elem.text:
+                return True
+        for child in elem:
+            if not _suppressed_element(child) and trim_start(child):
+                return True
+            if child.tail:
+                child.tail = child.tail.lstrip()
+                if child.tail:
+                    return True
+        return False
+
+    def visit(parent: ET.Element) -> None:
+        if _suppressed_element(parent):
+            return
+        children = list(parent)
+        for initial, paragraph in zip(children, children[1:]):
+            if (paragraph.tag != "p" or (initial.tail or "").strip()
+                    or styles.floats.get(paragraph, "none") != "none"
+                    or MinimalHtmlSanitizer._tokenize_hints(paragraph.get("class", ""), paragraph.get("id", ""))
+                    & MinimalHtmlSanitizer._HEADING_HINTS
+                    or not is_initial(initial)):
+                continue
+            continuation = continuation_start(paragraph)
+            # Capitalized words, punctuation, and empty paragraphs are ambiguous.
+            if not continuation or not continuation.isalpha() or continuation.isupper():
+                continue
+            for node in initial.iter():
+                if node.tag in {"div", "p"}:
+                    node.tag = "span"
+                if node.text:
+                    node.text = "".join(node.text.split())
+                if node is not initial and node.tail:
+                    node.tail = "".join(node.tail.split())
+            trim_start(paragraph)
+            parent.remove(initial)
+            initial.tail = paragraph.text
+            paragraph.text = None
+            paragraph.insert(0, initial)
+        for child in parent:
+            visit(child)
+
+    visit(body)
 
 
 def _marc_creator_role(value: str) -> Optional[str]:
@@ -1279,17 +1389,6 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         parts: list[str] = []
         fallback_toc: list[tuple[str, str, str, int]] = []
         for item in spine_items:
-            ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
-            guessed_title = _extract_title(item.document)
-            chapter_title = ncx_title or guessed_title
-            if (
-                not chapter_title
-                or chapter_title.strip().lower() in ("unknown", "untitled")
-                or chapter_title.strip().lower() == book_title.strip().lower()
-            ):
-                body_snippet = _extract_body_snippet(item.document, book_title)
-                chapter_title = body_snippet or chapter_title or item.stem or item.anchor
-
             sanitizer = MinimalHtmlSanitizer(
                 current_path=item.full_path,
                 file_anchor_map=file_anchor_map,
@@ -1302,6 +1401,18 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
                 styles=document_styles(item),
             )
             clean = sanitizer.sanitize(item.body)
+            # Derive fallback labels from the normalized reading text too.
+            ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
+            guessed_title = _extract_title(item.document)
+            chapter_title = ncx_title or guessed_title
+            if (
+                not chapter_title
+                or chapter_title.strip().lower() in ("unknown", "untitled")
+                or chapter_title.strip().lower() == book_title.strip().lower()
+            ):
+                body_snippet = _extract_body_snippet(item.document, book_title)
+                chapter_title = body_snippet or chapter_title or item.stem or item.anchor
+
             parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
             if clean:
                 if item.linear:
@@ -1499,6 +1610,7 @@ class MinimalHtmlSanitizer:
         self.fed = []
         if self.styles is None or body not in self.styles.styles:
             self.styles = _CssStyles(body, [])
+        _normalize_drop_caps(body, self.styles)
         self._emit(body)
         return "".join(self.fed)
 
