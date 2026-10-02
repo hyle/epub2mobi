@@ -21,6 +21,8 @@ import urllib.parse
 import unicodedata
 import zipfile
 import zlib
+from collections import OrderedDict
+from copy import deepcopy
 # ElementTree is used to keep the converter dependency-free.
 # Untrusted XML is size-limited and pre-screened for unsafe declarations in
 # _parse_xml(). Applications requiring a hardened external parser may use
@@ -69,6 +71,9 @@ MAX_XHTML_BYTES = 16 * 1024 * 1024
 MAX_CSS_BYTES = 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
+MAX_RESOURCE_CACHE_BYTES = 8 * 1024 * 1024
+MAX_RESOURCE_CACHE_ENTRIES = 128
+MAX_DOCUMENT_CACHE_NODES = 65536
 
 # EXTH Types
 EXTH_AUTHOR = 100
@@ -305,7 +310,11 @@ class TocTarget:
     parent: Optional[int] = None  # Index of the parent in this source's target list.
 
 
-class _NavigationSizeError(ValueError):
+class ConversionError(ValueError):
+    """Expected failure caused by input, a conversion request, or format limits."""
+
+
+class _NavigationSizeError(ConversionError):
     """The logical TOC cannot fit the supported single-record layout."""
 
 
@@ -391,12 +400,12 @@ def _encode_vwi(value: int) -> bytes:
 def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
                *, xhtml_entities: bool = False) -> ET.Element:
     if len(data) > (MAX_XML_BYTES if size_limit is None else size_limit):
-        raise ValueError(f"XML file too large: {source_name}")
+        raise ConversionError(f"XML file too large: {source_name}")
     # Expat sees declarations regardless of whether the XML is UTF-8, UTF-16, or UTF-32.
     guard = expat.ParserCreate()
 
     def reject_entity(*_args):
-        raise ValueError(f"Unsafe XML declaration in {source_name}")
+        raise ConversionError(f"Unsafe XML declaration in {source_name}")
 
     guard.EntityDeclHandler = reject_entity
     guard.ExternalEntityRefHandler = reject_entity
@@ -469,16 +478,14 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
             return ET.fromstring(text[:start] + doctype + text[end:])
         return ET.fromstring(data)
     except (ET.ParseError, expat.ExpatError, LookupError, UnicodeError) as e:
-        raise ValueError(f"Malformed XML: {source_name}") from e
+        raise ConversionError(f"Malformed XML: {source_name}") from e
 
 
-def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
+def _find_opf(resources: _ResourceReader) -> tuple[str, str]:
     try:
-        txt = _read_xml_member(z, "META-INF/container.xml")
+        root = resources.document("META-INF/container.xml")
     except KeyError as e:
-        raise ValueError("Invalid EPUB container: missing META-INF/container.xml") from e
-
-    root = _parse_xml(txt, "META-INF/container.xml")
+        raise ConversionError("Invalid EPUB container: missing META-INF/container.xml") from e
 
     opf_path = None
     for elem in root.iter():
@@ -488,11 +495,11 @@ def _find_opf(z: zipfile.ZipFile) -> tuple[str, str]:
                 opf_path = candidate
                 break
     if not opf_path:
-        raise ValueError("Invalid EPUB container: no rootfile in META-INF/container.xml")
+        raise ConversionError("Invalid EPUB container: no rootfile in META-INF/container.xml")
 
     normalized_opf = _normalize_epub_path(urllib.parse.unquote(opf_path))
     if normalized_opf in ("", "."):
-        raise ValueError("Invalid EPUB container: empty OPF path")
+        raise ConversionError("Invalid EPUB container: empty OPF path")
     return normalized_opf, posixpath.dirname(normalized_opf)
 
 
@@ -503,7 +510,7 @@ def _parse_xhtml(data: bytes, source_name: str) -> ET.Element:
     while stack:
         elem, depth = stack.pop()
         if depth > 256:
-            raise ValueError(f"XHTML nesting too deep: {source_name}")
+            raise ConversionError(f"XHTML nesting too deep: {source_name}")
         if elem.tag.startswith("{http://www.w3.org/1999/xhtml}"):
             elem.tag = _strip_ns(elem.tag)
         stack.extend((child, depth + 1) for child in elem)
@@ -514,7 +521,7 @@ def _body_element(root: ET.Element) -> ET.Element:
     if root.tag == "html":
         body = root.find("body")
         if body is None:
-            raise ValueError("XHTML document has no body")
+            raise ConversionError("XHTML document has no body")
         return body
     return root
 
@@ -581,14 +588,55 @@ def _extract_body_snippet(root: ET.Element, book_title: str, max_words: int = 10
 
 
 def _normalize_epub_path(path: str) -> str:
-    return posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+    parts: list[str] = []
+    for part in path.replace("\\", "/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ConversionError(f"EPUB path escapes the archive root: {path}")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts) or "."
+
+
+def _split_epub_url(url: str) -> urllib.parse.SplitResult:
+    try:
+        return urllib.parse.urlsplit(url)
+    except ValueError as e:
+        raise ConversionError(f"Invalid EPUB URL: {url}") from e
+
+
+def _resolve_epub_url(base_url: str, href: str) -> urllib.parse.SplitResult:
+    """Resolve local URLs without letting urljoin erase traversal above root."""
+    base = _split_epub_url(base_url)
+    reference = _split_epub_url(href)
+    if base.scheme or base.netloc or reference.scheme or reference.netloc:
+        return urllib.parse.urlsplit(urllib.parse.urljoin(base_url, href))
+    base_path = urllib.parse.unquote(base.path).replace("\\", "/")
+    path = urllib.parse.unquote(reference.path).replace("\\", "/")
+    if not path:
+        target = base_path
+    elif path.startswith("/"):
+        target = path
+    else:
+        target = posixpath.dirname(base_path) + "/" + path
+    normalized = _normalize_epub_path(target)
+    # A local <base href> can name a directory. Keep that distinction when
+    # the canonical URL becomes the base of subsequent resource references.
+    if target.endswith("/") or target.rsplit("/", 1)[-1] in {".", ".."}:
+        normalized = ("" if normalized == "." else normalized) + "/"
+    joined = urllib.parse.urlsplit(urllib.parse.urljoin(base_url, href))
+    return joined._replace(path=urllib.parse.quote(normalized, safe="/"))
 
 
 def _resolve_manifest_path(base_dir: str, href: str) -> str:
-    parsed = urllib.parse.urlsplit(href)
+    base_url = urllib.parse.quote(base_dir, safe="/") + "/" if base_dir else ""
+    parsed = _resolve_epub_url(base_url, href)
     if parsed.scheme or parsed.netloc:
-        raise ValueError(f"Invalid EPUB manifest href: {href}")
-    return _normalize_epub_path(posixpath.join(base_dir, urllib.parse.unquote(parsed.path)))
+        raise ConversionError(f"Invalid EPUB manifest href: {href}")
+    return _normalize_epub_path(urllib.parse.unquote(parsed.path))
 
 
 def _is_supported_image_media_type(media_type: str) -> bool:
@@ -601,14 +649,14 @@ def _document_base_url(root: ET.Element, current_path: str) -> str:
     if head is not None:
         for elem in head.iter("base"):
             if "href" in elem.attrib:
-                return urllib.parse.urljoin(document_url, elem.attrib["href"])
+                return _resolve_epub_url(document_url, elem.attrib["href"]).geturl()
     return document_url
 
 
 def _resolve_book_href(current_path: str, href: str,
                        base_url: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
     document_url = urllib.parse.quote(current_path, safe="/") if base_url is None else base_url
-    parsed = urllib.parse.urlsplit(urllib.parse.urljoin(document_url, href))
+    parsed = _resolve_epub_url(document_url, href)
     if parsed.scheme or parsed.netloc:
         return None
 
@@ -624,7 +672,10 @@ def _reported_media_path(current_path: str, href: Optional[str], fallback: str,
         return fallback
     if href.startswith("data:"):
         return "<data URI>"
-    resolved = _resolve_book_href(current_path, href, base_url)
+    try:
+        resolved = _resolve_book_href(current_path, href, base_url)
+    except ConversionError:
+        return href
     document_url = urllib.parse.quote(current_path, safe="/") if base_url is None else base_url
     return resolved[0] if resolved else urllib.parse.urljoin(document_url, href)
 
@@ -655,25 +706,25 @@ def _media_references(body: ET.Element):
 
 
 def _extract_nav_toc_targets(
-    z: zipfile.ZipFile,
+    resources: _ResourceReader,
     manifest: dict[str, ManifestItem],
     base_dir: str,
-) -> list[TocTarget]:
+) -> tuple[list[TocTarget], bool]:
     nav_href = None
     for item in manifest.values():
         if "nav" in item.properties.split() and item.media_type == "application/xhtml+xml":
             nav_href = item.href
             break
     if not nav_href:
-        return []
+        return [], False
 
     nav_path = nav_href
     try:
         nav_path = _resolve_manifest_path(base_dir, nav_href)
-        nav_root = _parse_xhtml(_read_xml_member(z, nav_path), nav_path)
-    except (KeyError, ValueError):
+        nav_root = resources.document(nav_path, xhtml=True)
+    except (KeyError, ConversionError):
         logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
-        return []
+        return [], True
 
     toc_nav = None
     for elem in _visible_elements(nav_root):
@@ -689,19 +740,30 @@ def _extract_nav_toc_targets(
             toc_nav = elem
             break
     if toc_nav is None:
-        return []
+        return [], False
 
     toc_targets: list[TocTarget] = []
-    nav_base_url = _document_base_url(nav_root, nav_path)
+    invalid_destinations = False
+    try:
+        nav_base_url = _document_base_url(nav_root, nav_path)
+    except ConversionError as e:
+        logger.warning("Unable to resolve EPUB3 nav base: %s: %s", nav_path, e)
+        return [], True
 
     def add_link(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
+        nonlocal invalid_destinations
         raw_href = elem.attrib.get("href")
         if not raw_href:
             return parent
         label = " ".join(_visible_text(elem).split())
         if not label:
             return parent
-        resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
+        try:
+            resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
+        except ConversionError as e:
+            logger.warning("EPUB3 nav TOC: skipped invalid destination %s: %s", raw_href, e)
+            invalid_destinations = True
+            return parent
         if resolved is None:
             return parent
         target_path, fragment = resolved
@@ -722,11 +784,11 @@ def _extract_nav_toc_targets(
         link = next((child for child in elem if child.tag == "a"), None) if elem.tag == "li" else None
         child_parent = add_link(link, parent) if link is not None else parent
         stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not link)
-    return toc_targets
+    return toc_targets, invalid_destinations
 
 
 def _extract_ncx_toc_targets(
-    z: zipfile.ZipFile,
+    resources: _ResourceReader,
     spine_node: ET.Element,
     manifest: dict[str, ManifestItem],
     base_dir: str,
@@ -746,8 +808,8 @@ def _extract_ncx_toc_targets(
     ncx_path = ncx_href
     try:
         ncx_path = _resolve_manifest_path(base_dir, ncx_href)
-        ncx_root = _parse_xml(_read_xml_member(z, ncx_path), ncx_path)
-    except (KeyError, ValueError):
+        ncx_root = resources.document(ncx_path)
+    except (KeyError, ConversionError):
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
         return []
 
@@ -769,7 +831,11 @@ def _extract_ncx_toc_targets(
                         break
             content = next((child for child in elem if _strip_ns(child.tag) == "content"), None)
             src = content.get("src") if content is not None else None
-            resolved = _resolve_book_href(ncx_path, src) if src else None
+            try:
+                resolved = _resolve_book_href(ncx_path, src) if src else None
+            except ConversionError as e:
+                logger.warning("NCX TOC: skipped invalid destination %s: %s", src, e)
+                resolved = None
             if label and resolved is not None:
                 target_path, fragment = resolved
                 child_parent = len(targets)
@@ -787,45 +853,49 @@ def _read_zip_member(
     aggregate_budget: int,
     aggregate_used: int,
     kind: str,
+    info: Optional[zipfile.ZipInfo] = None,
+    accounted_size: Optional[int] = None,
 ) -> tuple[bytes, int]:
-    try:
-        info = z.getinfo(member_path)
-    except KeyError as e:
-        raise KeyError(member_path) from e
+    if info is None:
+        try:
+            info = z.getinfo(member_path)
+        except KeyError as e:
+            raise KeyError(member_path) from e
 
     if info.file_size > size_limit:
-        raise ValueError(
+        raise ConversionError(
             f"{kind} too large: {member_path} ({info.file_size} bytes > {size_limit} bytes)"
         )
 
-    new_total = aggregate_used + info.file_size
+    # A reread after cache eviction retains the previously validated actual
+    # charge, even if the ZIP declaration overstated the extracted size.
+    new_total = aggregate_used + (info.file_size if accounted_size is None else accounted_size)
     if new_total > aggregate_budget:
-        raise ValueError(
+        raise ConversionError(
             f"EPUB content too large: extracting {member_path} would exceed {aggregate_budget} bytes"
         )
 
-    with z.open(member_path) as member:
-        data = member.read(size_limit + 1)
+    read_errors = (NotImplementedError, RuntimeError, EOFError, UnicodeDecodeError, zlib.error)
+    if info.compress_type == zipfile.ZIP_LZMA:
+        # Like zipfile, allow Python builds without the optional LZMA module.
+        try:
+            from lzma import LZMAError
+        except ImportError as e:
+            raise ConversionError(f"Cannot read EPUB member {member_path}: LZMA support is unavailable") from e
+        read_errors += (LZMAError,)
+    try:
+        with z.open(info) as member:
+            data = member.read(size_limit + 1)
+    except read_errors as e:
+        raise ConversionError(f"Cannot read EPUB member {member_path}: {e}") from e
     if len(data) > size_limit:
-        raise ValueError(f"{kind} too large: {member_path}")
+        raise ConversionError(f"{kind} too large: {member_path}")
     actual_total = aggregate_used + len(data)
     if actual_total > aggregate_budget:
-        raise ValueError(
+        raise ConversionError(
             f"EPUB content too large: extracting {member_path} would exceed {aggregate_budget} bytes"
         )
     return data, actual_total
-
-
-def _read_xml_member(z: zipfile.ZipFile, member_path: str) -> bytes:
-    data, _ = _read_zip_member(
-        z,
-        member_path,
-        size_limit=MAX_XML_BYTES,
-        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-        aggregate_used=0,
-        kind="XML file",
-    )
-    return data
 
 
 def _css_parts(text: str, separators: str):
@@ -1188,18 +1258,17 @@ def _raster_signature_matches(data: bytes, media_type: str) -> bool:
     return data.startswith(signatures.get(media_type.lower(), ()))
 
 
-def _read_package(z: zipfile.ZipFile) -> _EpubPackage:
+def _read_package(resources: _ResourceReader) -> _EpubPackage:
     book_title = "Unknown"
     book_author = "Unknown"
     book_uuid = "000000000000"
     book_language = None
 
-    opf_path, base_dir = _find_opf(z)
+    opf_path, base_dir = _find_opf(resources)
     try:
-        opf_xml = _read_xml_member(z, opf_path)
+        opf_root = resources.document(opf_path)
     except KeyError as e:
-        raise ValueError(f"OPF declared in container is missing: {opf_path}") from e
-    opf_root = _parse_xml(opf_xml, opf_path)
+        raise ConversionError(f"OPF declared in container is missing: {opf_path}") from e
 
     unique_id = opf_root.attrib.get("unique-identifier")
     fallback_uuid = None
@@ -1239,7 +1308,7 @@ def _read_package(z: zipfile.ZipFile) -> _EpubPackage:
         elif t == "spine":
             spine_node = child
     if manifest_node is None or spine_node is None:
-        raise ValueError("Malformed OPF: missing manifest or spine")
+        raise ConversionError("Malformed OPF: missing manifest or spine")
 
     manifest: dict[str, ManifestItem] = {}
     for item in list(manifest_node):
@@ -1255,11 +1324,16 @@ def _read_package(z: zipfile.ZipFile) -> _EpubPackage:
                     properties=item.get("properties", ""),
                     fallback=item.get("fallback") or (previous.fallback if previous else None),
                 )
-    manifest_paths = {
-        _resolve_manifest_path(base_dir, item.href): iid
-        for iid, item in manifest.items()
-        if _resolve_book_href(opf_path, item.href) is not None
-    }
+    manifest_paths: dict[str, str] = {}
+    for iid, item in manifest.items():
+        try:
+            resolved = _resolve_book_href(opf_path, item.href)
+        except ConversionError:
+            # Required spine paths are rejected when selecting spine items;
+            # optional invalid paths are retained only for omission reporting.
+            continue
+        if resolved is not None:
+            manifest_paths[resolved[0]] = iid
 
     return _EpubPackage(
         opf_path=opf_path, base_dir=base_dir, title=book_title, author=book_author,
@@ -1269,21 +1343,88 @@ def _read_package(z: zipfile.ZipFile) -> _EpubPackage:
 
 
 class _ResourceReader:
-    """Own the shared content budget and ordered omission report for one EPUB."""
+    """Own unique-member accounting, bounded caches, and omission reporting."""
 
     def __init__(self, archive: zipfile.ZipFile):
         self.archive = archive
         self.bytes_read = 0
+        # Header offsets identify selected physical entries, including ZIPs
+        # containing duplicate filenames. Accounting survives cache eviction.
+        self._member_sizes: dict[int, int] = {}
+        self._raw_cache: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+        self._raw_bytes = 0
+        self._documents: OrderedDict[tuple[str, int, bool], tuple[ET.Element, int, int]] = OrderedDict()
+        self._document_bytes = 0
+        self._document_nodes = 0
         self.omissions: list[MediaOmission] = []
         self._seen_omissions: set[MediaOmission] = set()
 
     def read(self, path: str, *, size_limit: int, kind: str) -> bytes:
-        data, self.bytes_read = _read_zip_member(
+        path = _normalize_epub_path(path)
+        return self._read(path, self.archive.getinfo(path), size_limit=size_limit, kind=kind)
+
+    @staticmethod
+    def _check_size(path: str, info: zipfile.ZipInfo, actual: int, size_limit: int, kind: str) -> None:
+        if max(info.file_size, actual) > size_limit:
+            raise ConversionError(f"{kind} too large: {path}")
+
+    def _read(self, path: str, info: zipfile.ZipInfo, *, size_limit: int, kind: str) -> bytes:
+        member = info.header_offset
+        # Including the path forces ZIP header validation if malformed central
+        # entries claim different filenames for the same physical offset.
+        key = (path, member)
+        data = self._raw_cache.get(key)
+        if data is not None:
+            self._check_size(path, info, len(data), size_limit, kind)
+            self._raw_cache.move_to_end(key)
+            return data
+        data, total = _read_zip_member(
             self.archive, path, size_limit=size_limit,
             aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-            aggregate_used=self.bytes_read, kind=kind,
+            aggregate_used=self.bytes_read - self._member_sizes.get(member, 0), kind=kind, info=info,
+            accounted_size=self._member_sizes.get(member),
         )
+        self.bytes_read = total
+        self._member_sizes[member] = len(data)
+        if len(data) <= MAX_RESOURCE_CACHE_BYTES and MAX_RESOURCE_CACHE_ENTRIES > 0:
+            while self._raw_cache and (self._raw_bytes + len(data) > MAX_RESOURCE_CACHE_BYTES
+                                      or len(self._raw_cache) >= MAX_RESOURCE_CACHE_ENTRIES):
+                _, evicted = self._raw_cache.popitem(last=False)
+                self._raw_bytes -= len(evicted)
+            self._raw_cache[key] = data
+            self._raw_bytes += len(data)
         return data
+
+    def document(self, path: str, *, xhtml: bool = False, mutable: bool = False,
+                 size_limit: Optional[int] = None, kind: str = "XML file") -> ET.Element:
+        path = _normalize_epub_path(path)
+        info = self.archive.getinfo(path)
+        limit = MAX_XML_BYTES if size_limit is None else size_limit
+        key = (path, info.header_offset, xhtml)
+        cached = self._documents.get(key)
+        if cached is not None:
+            root, source_size, _ = cached
+            self._check_size(path, info, source_size, limit, kind)
+            self._documents.move_to_end(key)
+            return deepcopy(root) if mutable else root
+        data = self._read(path, info, size_limit=limit, kind=kind)
+        root = _parse_xhtml(data, path) if xhtml else _parse_xml(data, path)
+        nodes = sum(1 for _ in root.iter())
+        if (len(data) <= MAX_RESOURCE_CACHE_BYTES and nodes <= MAX_DOCUMENT_CACHE_NODES
+                and MAX_RESOURCE_CACHE_ENTRIES > 0):
+            while self._documents and (
+                self._document_bytes + len(data) > MAX_RESOURCE_CACHE_BYTES
+                or self._document_nodes + nodes > MAX_DOCUMENT_CACHE_NODES
+                or len(self._documents) >= MAX_RESOURCE_CACHE_ENTRIES
+            ):
+                _, (_, source_size, evicted_nodes) = self._documents.popitem(last=False)
+                self._document_bytes -= source_size
+                self._document_nodes -= evicted_nodes
+            self._documents[key] = root, len(data), nodes
+            self._document_bytes += len(data)
+            self._document_nodes += nodes
+            return deepcopy(root) if mutable else root
+        return root
 
     def omit(self, resource: str, source: str, reason: str) -> None:
         omission = MediaOmission(resource=resource, source=source, reason=reason)
@@ -1300,13 +1441,18 @@ def _report_manifest_omissions(package: _EpubPackage, resources: _ResourceReader
     for item in package.manifest.values():
         href = item.href
         media_type = item.media_type.lower()
-        resource_path = urllib.parse.urlsplit(href).path.lower()
+        try:
+            resource_path = _split_epub_url(href).path.lower()
+            resolved = _resolve_book_href(package.opf_path, href)
+        except ConversionError as e:
+            resources.omit(href, package.opf_path, str(e))
+            continue
         is_font = (
             media_type.startswith("font/")
             or media_type in font_media_types
             or resource_path.endswith((".ttf", ".otf", ".woff", ".woff2"))
         )
-        if _resolve_book_href(package.opf_path, href) is None:
+        if resolved is None:
             resources.omit(
                 _reported_media_path(package.opf_path, href, href), package.opf_path,
                 "remote or data URI manifest resource is not embedded",
@@ -1336,9 +1482,9 @@ def _select_spine_item(item_id: str, package: _EpubPackage, resources: _Resource
     current = item_id
     while True:
         if current in chain:
-            raise ValueError(f"Cyclic manifest fallback chain: {item_id}")
+            raise ConversionError(f"Cyclic manifest fallback chain: {item_id}")
         if current not in package.manifest:
-            raise ValueError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
+            raise ConversionError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
         chain.append(current)
         media_type = package.manifest[current].media_type.lower()
         local = _resolve_book_href(package.opf_path, package.manifest[current].href) is not None
@@ -1347,10 +1493,10 @@ def _select_spine_item(item_id: str, package: _EpubPackage, resources: _Resource
         fallback = package.manifest[current].fallback
         if not fallback:
             if not local:
-                raise ValueError(f"Remote spine content is not supported: {package.manifest[current].href}")
+                raise ConversionError(f"Remote spine content is not supported: {package.manifest[current].href}")
             if media_type == "image/svg+xml":
                 break  # Retain the existing SVG omission behavior.
-            raise ValueError(f"Unsupported spine media type without readable fallback: {media_type}")
+            raise ConversionError(f"Unsupported spine media type without readable fallback: {media_type}")
         current = fallback
     aliases = tuple(_resolve_manifest_path(package.base_dir, package.manifest[iid].href) for iid in chain
                     if _resolve_book_href(package.opf_path, package.manifest[iid].href) is not None)
@@ -1371,14 +1517,14 @@ def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list
             svg_spine_paths.add(full)
             resources.omit(full, package.opf_path, "SVG spine content is not rendered")
         try:
-            raw_bytes = resources.read(full, size_limit=MAX_XHTML_BYTES, kind="Spine XHTML")
+            document = resources.document(full, xhtml=True, mutable=True,
+                                          size_limit=MAX_XHTML_BYTES, kind="Spine XHTML")
         except KeyError as e:
-            raise ValueError(f"Missing spine item in EPUB: {full}") from e
-        document = _parse_xhtml(raw_bytes, full)
+            raise ConversionError(f"Missing spine item in EPUB: {full}") from e
         try:
             body = _body_element(document)
-        except ValueError as e:
-            raise ValueError(f"Invalid XHTML: {full}: {e}") from e
+        except ConversionError as e:
+            raise ConversionError(f"Invalid XHTML: {full}: {e}") from e
         anchor = f"spine_{spine_idx}"
         body_fragments = tuple(body.get(key) for key in ("id", "name")
                                if body.tag == "body" and body.get(key))
@@ -1471,7 +1617,11 @@ class _ImageLoader:
                 if not raw_src:
                     self.resources.omit("<img without src>", item.full_path, "image has no source")
                     continue
-                resolved = _resolve_book_href(item.full_path, raw_src, item.base_url)
+                try:
+                    resolved = _resolve_book_href(item.full_path, raw_src, item.base_url)
+                except ConversionError as e:
+                    self.resources.omit(raw_src, item.full_path, str(e))
+                    continue
                 if resolved is None:
                     resource = _reported_media_path(item.full_path, raw_src, raw_src, item.base_url)
                     self.resources.omit(resource, item.full_path, "external or data URI image is not embedded")
@@ -1487,7 +1637,11 @@ class _ImageLoader:
                 self.resources.omit(cover_id, self.package.opf_path, "cover item is not declared in the EPUB manifest")
             else:
                 cover_href = cover_item.href
-                resolved = _resolve_book_href(self.package.opf_path, cover_href)
+                try:
+                    resolved = _resolve_book_href(self.package.opf_path, cover_href)
+                except ConversionError as e:
+                    self.resources.omit(cover_href, self.package.opf_path, str(e))
+                    return
                 if resolved is None:
                     self.resources.omit(_reported_media_path(self.package.opf_path, cover_href, cover_href),
                                         self.package.opf_path, "external or data URI cover is not embedded")
@@ -1524,14 +1678,18 @@ class _StylesheetLoader:
             if elem.tag == "style":
                 text = "".join(elem.itertext())
                 if len(text.encode("utf-8")) > MAX_CSS_BYTES:
-                    raise ValueError(f"CSS file too large: embedded style in {item.full_path}")
+                    raise ConversionError(f"CSS file too large: embedded style in {item.full_path}")
                 rules.extend(_css_rules(text))
                 continue
             rel = elem.get("rel", "").lower().split()
             href = elem.get("href")
             if "stylesheet" not in rel or "alternate" in rel or not href:
                 continue
-            resolved = _resolve_book_href(item.full_path, href, item.base_url)
+            try:
+                resolved = _resolve_book_href(item.full_path, href, item.base_url)
+            except ConversionError as e:
+                self.resources.omit(href, item.full_path, str(e))
+                continue
             if resolved is None:
                 self.resources.omit(_reported_media_path(item.full_path, href, href, item.base_url),
                                     item.full_path, "external or data URI stylesheet is not loaded")
@@ -1632,13 +1790,14 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
 
 
 def _select_toc(nav_targets: list[TocTarget], ncx_targets: list[TocTarget],
-                fallback_toc: list[ResolvedTocEntry], index: _SpineIndex) -> list[ResolvedTocEntry]:
+                fallback_toc: list[ResolvedTocEntry], index: _SpineIndex,
+                nav_invalid: bool = False) -> list[ResolvedTocEntry]:
     nav_toc, nav_incomplete = _resolve_toc_targets(nav_targets, "EPUB3 nav", index)
     ncx_toc, _ = _resolve_toc_targets(ncx_targets, "NCX", index)
     # Preserve authored TOCs even when some links are stale. A more complete
     # NCX can replace an incomplete nav; spine guesses are only a last resort.
     if nav_toc:
-        raw_toc = ncx_toc if nav_incomplete and len(ncx_toc) > len(nav_toc) else nav_toc
+        raw_toc = ncx_toc if (nav_incomplete or nav_invalid) and len(ncx_toc) > len(nav_toc) else nav_toc
     else:
         raw_toc = ncx_toc or fallback_toc
 
@@ -1676,19 +1835,23 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
     if not filepath.exists():
         raise FileNotFoundError(str(filepath))
 
-    with zipfile.ZipFile(filepath, "r") as archive:
-        package = _read_package(archive)
+    try:
+        archive = zipfile.ZipFile(filepath, "r")
+    except (NotImplementedError, UnicodeDecodeError) as e:
+        raise ConversionError(f"Cannot open EPUB archive {filepath}: {e}") from e
+    with archive:
         resources = _ResourceReader(archive)
+        package = _read_package(resources)
         _report_manifest_omissions(package, resources)
-        nav_targets = _extract_nav_toc_targets(archive, package.manifest, package.base_dir)
-        ncx_targets = _extract_ncx_toc_targets(archive, package.spine, package.manifest, package.base_dir)
+        nav_targets, nav_invalid = _extract_nav_toc_targets(resources, package.manifest, package.base_dir)
+        ncx_targets = _extract_ncx_toc_targets(resources, package.spine, package.manifest, package.base_dir)
         spine_items, svg_spine_paths = _load_spine(package, resources)
         index = _index_spine(spine_items)
         images = _ImageLoader(package, resources)
         images.load(spine_items, svg_spine_paths)
         styles = _StylesheetLoader(resources)
         html_content, fallback_toc = _render_spine(package, spine_items, index, images, styles, ncx_targets)
-        raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index)
+        raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index, nav_invalid)
         toc_entries, toc_depths = _finalize_toc(raw_toc)
 
         logger.info("Parsed %d spine items. Title: %s", len(spine_items), package.title)
@@ -1765,7 +1928,11 @@ class MinimalHtmlSanitizer:
                 self.fed.append(marker)
 
     def _rewrite_href(self, href: str) -> Optional[str]:
-        resolved = _resolve_book_href(self.current_path, href, self.base_url)
+        try:
+            resolved = _resolve_book_href(self.current_path, href, self.base_url)
+        except ConversionError as e:
+            logger.warning("Skipped invalid link in %s: %s: %s", self.current_path, href, e)
+            return None
         if resolved is None:
             return urllib.parse.urljoin(self.base_url, href)
 
@@ -1830,7 +1997,10 @@ class MinimalHtmlSanitizer:
             output_tag = "td" if output_tag == "th" else "p"
         if tag == "img":
             src = attrs.get("src", "")
-            resolved = _resolve_book_href(self.current_path, src, self.base_url) if src else None
+            try:
+                resolved = _resolve_book_href(self.current_path, src, self.base_url) if src else None
+            except ConversionError:
+                resolved = None  # The image loader already reports this omission.
             recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
             if recindex is not None:
                 self.fed.append(f'<img recindex="{recindex}"/>')
@@ -2253,9 +2423,9 @@ class MobiWriter:
     @staticmethod
     def _validate_record_layout(text_rec_count: int, total_records: int) -> None:
         if text_rec_count > 0xFFFF:
-            raise ValueError(f"Too many PalmDOC text records: {text_rec_count}")
+            raise ConversionError(f"Too many PalmDOC text records: {text_rec_count}")
         if total_records > 0xFFFF:
-            raise ValueError(f"Too many records for PDB: {total_records}")
+            raise ConversionError(f"Too many records for PDB: {total_records}")
 
     @staticmethod
     def _build_flis() -> bytes:
@@ -2610,7 +2780,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         if outfile.exists() and infile.samefile(outfile):
-            raise ValueError("Output path resolves to the input EPUB; choose a different output path")
+            raise ConversionError("Output path resolves to the input EPUB; choose a different output path")
         epub_data = parse_epub(infile)
         MobiWriter(epub_data).build(str(outfile))
         _log_media_omissions(epub_data.omitted_media, args.report_omissions)
@@ -2619,7 +2789,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             deploy_to_kindle(str(outfile))
 
         return 0
-    except Exception as e:
+    except (ConversionError, OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as e:
         logger.error("Error: %s", e)
         return 1
 
