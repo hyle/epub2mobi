@@ -565,7 +565,11 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
             resolved_guard.Parse(text, True)
             return ET.fromstring(text)
         return ET.fromstring(data)
-    except (ET.ParseError, expat.ExpatError, LookupError, UnicodeError) as e:
+    except ConversionError:
+        # Parser callbacks raise conversion and processing-limit failures.
+        # Preserve them: ConversionError itself is a ValueError subclass.
+        raise
+    except (ET.ParseError, expat.ExpatError, LookupError, ValueError) as e:
         raise ConversionError(f"Malformed XML: {source_name}") from e
 
 
@@ -951,11 +955,29 @@ def _check_zip_compression(info: zipfile.ZipInfo) -> None:
         )
 
 
+def _validate_archive_member_name(info: zipfile.ZipInfo) -> list[str]:
+    # Unlike URI resolution, physical member names must not be repaired.
+    raw = info.orig_filename
+    if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in raw):
+        raise ConversionError(f"EPUB archive member contains control characters: {raw!r}")
+    parts = (raw[:-1] if raw.endswith("/") else raw).split("/")
+    if ("\\" in raw or re.match(r"^[A-Za-z]:", raw)
+            or any(part in {"", ".", ".."} for part in parts)):
+        raise ConversionError(f"Invalid EPUB archive member name: {raw!r}")
+    return parts
+
+
 def _validate_archive(archive: zipfile.ZipFile) -> None:
     entries = archive.infolist()
     if len(entries) > MAX_ARCHIVE_ENTRIES:
         raise ConversionError(f"EPUB archive has too many entries: {len(entries)} > {MAX_ARCHIVE_ENTRIES}")
     declared_total = 0
+    seen_names: set[str] = set()
+    # Component nodes include implicit directories. Integer parent IDs avoid
+    # retaining every full prefix of a deeply nested path.
+    nodes: dict[tuple[int, str], tuple[int, bool]] = {}
+    canonical_nodes: dict[tuple[int, str], tuple[int, str]] = {}
+    collision = None
     for info in entries:
         _check_zip_compression(info)
         declared_total += info.file_size
@@ -963,6 +985,34 @@ def _validate_archive(archive: zipfile.ZipFile) -> None:
             raise ConversionError(
                 f"EPUB archive declared content too large: exceeds {MAX_ARCHIVE_UNCOMPRESSED_BYTES} bytes"
             )
+        parts = _validate_archive_member_name(info)
+        raw = info.orig_filename
+        if raw in seen_names:
+            raise ConversionError(f"Duplicate EPUB archive member: {raw!r}")
+        seen_names.add(raw)
+        parent = canonical_parent = 0
+        for index, part in enumerate(parts):
+            directory = index < len(parts) - 1 or info.is_dir()
+            key = (parent, part)
+            if key not in nodes:
+                nodes[key] = (len(nodes) + 1, directory)
+            parent, previous_directory = nodes[key]
+            if previous_directory != directory:
+                raise ConversionError(f"EPUB archive file/directory conflict: {raw!r}")
+            folded = unicodedata.normalize("NFC", unicodedata.normalize("NFC", part).casefold())
+            canonical_key = (canonical_parent, folded)
+            if canonical_key not in canonical_nodes:
+                canonical_nodes[canonical_key] = (len(canonical_nodes) + 1, part)
+            canonical_parent, previous_part = canonical_nodes[canonical_key]
+            if previous_part != part and collision is None:
+                collision = (previous_part, part, "/".join(parts[:index]) or "/")
+    if collision is not None:
+        # Exact ZIP lookup remains case sensitive; report interoperability
+        # issues without rejecting otherwise usable books or remapping names.
+        logger.warning(
+            "EPUB archive names differ only by case or Unicode normalization: %r and %r in %s; "
+            "exact names are preserved (further collisions are not listed)", *collision,
+        )
 
 
 def _read_zip_member(
@@ -1433,6 +1483,7 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
         raise ConversionError("Malformed OPF: missing manifest or spine")
 
     manifest: dict[str, ManifestItem] = {}
+    manifest_ids: set[str] = set()
     manifest_count = 0
     for item in list(manifest_node):
         if _strip_ns(item.tag) == "item":
@@ -1441,14 +1492,16 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
                 raise _ResourceLimitError(f"Too many manifest entries: {opf_path}")
             iid = item.attrib.get("id")
             href = item.attrib.get("href")
+            if iid:
+                if iid in manifest_ids:
+                    raise ConversionError(f"Duplicate manifest id: {iid!r}")
+                manifest_ids.add(iid)
             if iid and href:
-                # Preserve the existing fallback handling for repeated manifest IDs.
-                previous = manifest.get(iid)
                 manifest[iid] = ManifestItem(
                     href=href,
                     media_type=item.get("media-type", ""),
                     properties=item.get("properties", ""),
-                    fallback=item.get("fallback") or (previous.fallback if previous else None),
+                    fallback=item.get("fallback"),
                 )
     manifest_paths: dict[str, str] = {}
     for iid, item in manifest.items():
@@ -1459,7 +1512,13 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
             # optional invalid paths are retained only for omission reporting.
             continue
         if resolved is not None:
-            manifest_paths[resolved[0]] = iid
+            path = resolved[0]
+            if path in manifest_paths:
+                raise ConversionError(
+                    f"Duplicate manifest local resource path: {manifest_paths[path]!r} and {iid!r} "
+                    f"both resolve to {path!r}"
+                )
+            manifest_paths[path] = iid
 
     return _EpubPackage(
         opf_path=opf_path, base_dir=base_dir, title=book_title, author=book_author,
