@@ -71,9 +71,26 @@ MAX_XHTML_BYTES = 16 * 1024 * 1024
 MAX_CSS_BYTES = 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 10000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+MAX_DECOMPRESSION_WORK_BYTES = 512 * 1024 * 1024
 MAX_RESOURCE_CACHE_BYTES = 8 * 1024 * 1024
 MAX_RESOURCE_CACHE_ENTRIES = 128
 MAX_DOCUMENT_CACHE_NODES = 65536
+MAX_XML_DEPTH = 256  # Root has depth zero.
+MAX_XML_ELEMENTS = 100000
+MAX_XML_ATTRIBUTES = 200000
+MAX_XML_ATTRIBUTE_CHARS = 65536
+MAX_BOOK_ENTRIES = 10000  # Each of manifest, spine, and navigation.
+MAX_SPINE_ELEMENTS = 1000000
+MAX_SPINE_BYTES = 64 * 1024 * 1024  # Source bytes, counting repeated occurrences.
+MAX_CSS_RULES = 10000
+MAX_CSS_SELECTORS = 50000
+MAX_DOCUMENT_CSS_BYTES = 4 * MAX_CSS_BYTES
+MAX_CSS_PROCESSING_BYTES = 256 * 1024 * 1024
+MAX_CSS_PROCESSING_SELECTORS = 5000000
+MAX_OUTPUT_HTML_BYTES = 64 * 1024 * 1024  # Encoded MOBI HTML, including the footer TOC.
 
 # EXTH Types
 EXTH_AUTHOR = 100
@@ -318,6 +335,10 @@ class _NavigationSizeError(ConversionError):
     """The logical TOC cannot fit the supported single-record layout."""
 
 
+class _ResourceLimitError(ConversionError):
+    """A processing budget is exhausted; optional resources cannot bypass it."""
+
+
 def _toc_parent_indices(depths: tuple[int, ...]) -> list[Optional[int]]:
     """Validate preorder depths and locate each entry's nearest ancestor."""
     parents: list[Optional[int]] = []
@@ -342,6 +363,29 @@ def _crc32_u32(s: str) -> int:
 def _encode_mobi_text(s: str) -> bytes:
     """Encode as CP1252. Use XML entities for characters that don't fit."""
     return s.encode(MOBI_TEXT_ENCODING_PY, errors="xmlcharrefreplace")
+
+
+class _HtmlBuffer:
+    """Bound encoded output before joining retained HTML fragments."""
+
+    def __init__(self, limit: Optional[int] = None):
+        self.limit = MAX_OUTPUT_HTML_BYTES if limit is None else limit
+        self.parts: list[str] = []
+        self.size = 0
+
+    def append(self, text: str) -> None:
+        size = len(_encode_mobi_text(text))
+        if self.size + size > self.limit:
+            raise _ResourceLimitError("Generated HTML too large")
+        self.size += size
+        self.parts.append(text)
+
+    def extend(self, parts) -> None:
+        for part in parts:
+            self.append(part)
+
+    def text(self) -> str:
+        return "".join(self.parts)
 
 
 def _encode_meta(s: str) -> bytes:
@@ -399,10 +443,11 @@ def _encode_vwi(value: int) -> bytes:
 
 def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
                *, xhtml_entities: bool = False) -> ET.Element:
-    if len(data) > (MAX_XML_BYTES if size_limit is None else size_limit):
+    limit = MAX_XML_BYTES if size_limit is None else size_limit
+    if len(data) > limit:
         raise ConversionError(f"XML file too large: {source_name}")
     # Expat sees declarations regardless of whether the XML is UTF-8, UTF-16, or UTF-32.
-    guard = expat.ParserCreate()
+    guard = expat.ParserCreate(namespace_separator="}")
 
     def reject_entity(*_args):
         raise ConversionError(f"Unsafe XML declaration in {source_name}")
@@ -417,10 +462,39 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
     subset_start = None
     subset_end = None
     in_prolog = True
+    depth = elements = attributes = name_chars = 0
 
-    def start_element(_name, _attributes):
-        nonlocal in_prolog
+    def check_attributes(attrs):
+        nonlocal attributes
+        attributes += len(attrs)
+        if attributes > MAX_XML_ATTRIBUTES:
+            raise _ResourceLimitError(f"Too many XML attributes: {source_name}")
+        if any(max(len(name), len(value)) > MAX_XML_ATTRIBUTE_CHARS for name, value in attrs.items()):
+            raise _ResourceLimitError(f"XML attribute too long: {source_name}")
+
+    def namespace(prefix, uri):
+        # Expat removes namespace declarations from the element's attributes.
+        check_attributes({"xmlns" + (":" + prefix if prefix else ""): uri or ""})
+
+    def start_element(name, attrs):
+        nonlocal in_prolog, depth, elements, name_chars
         in_prolog = False
+        elements += 1
+        if depth > MAX_XML_DEPTH:
+            raise _ResourceLimitError(f"XML nesting too deep: {source_name}")
+        if elements > MAX_XML_ELEMENTS:
+            raise _ResourceLimitError(f"Too many XML elements: {source_name}")
+        check_attributes(attrs)
+        # A long namespace URI shared by many distinct names expands inside
+        # the tree. Bound that work even when the source XML is small.
+        name_chars += len(name) + sum(len(key) for key in attrs)
+        if name_chars > limit:
+            raise _ResourceLimitError(f"XML expanded names too large: {source_name}")
+        depth += 1
+
+    def end_element(_name):
+        nonlocal depth
+        depth -= 1
 
     def xml_declaration(_version, declared_encoding, _standalone):
         nonlocal encoding
@@ -448,6 +522,8 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
 
     guard.XmlDeclHandler = xml_declaration
     guard.StartElementHandler = start_element
+    guard.EndElementHandler = end_element
+    guard.StartNamespaceDeclHandler = namespace
     guard.DefaultHandler = declaration_token
     guard.EndDoctypeDeclHandler = end_doctype
     try:
@@ -475,7 +551,16 @@ def _parse_xml(data: bytes, source_name: str, size_limit: Optional[int] = None,
                                    for name, code in name2codepoint.items()
                                    if name not in {"amp", "lt", "gt", "quot", "apos"})
             doctype = f"<!DOCTYPE {doctype_name} [{subset}{declarations}]>"
-            return ET.fromstring(text[:start] + doctype + text[end:])
+            text = text[:start] + doctype + text[end:]
+            # The initial guard skips external DTD entities in attributes.
+            # Check their locally resolved values before allocating the tree.
+            depth = elements = attributes = name_chars = 0
+            resolved_guard = expat.ParserCreate(namespace_separator="}")
+            resolved_guard.StartElementHandler = start_element
+            resolved_guard.EndElementHandler = end_element
+            resolved_guard.StartNamespaceDeclHandler = namespace
+            resolved_guard.Parse(text, True)
+            return ET.fromstring(text)
         return ET.fromstring(data)
     except (ET.ParseError, expat.ExpatError, LookupError, UnicodeError) as e:
         raise ConversionError(f"Malformed XML: {source_name}") from e
@@ -506,14 +591,12 @@ def _find_opf(resources: _ResourceReader) -> tuple[str, str]:
 def _parse_xhtml(data: bytes, source_name: str) -> ET.Element:
     root = _parse_xml(data, source_name, MAX_XHTML_BYTES, xhtml_entities=True)
     # Normalize XHTML only; foreign vocabularies must not become HTML elements.
-    stack = [(root, 0)]
+    stack = [root]
     while stack:
-        elem, depth = stack.pop()
-        if depth > 256:
-            raise ConversionError(f"XHTML nesting too deep: {source_name}")
+        elem = stack.pop()
         if elem.tag.startswith("{http://www.w3.org/1999/xhtml}"):
             elem.tag = _strip_ns(elem.tag)
-        stack.extend((child, depth + 1) for child in elem)
+        stack.extend(elem)
     return root
 
 
@@ -722,6 +805,8 @@ def _extract_nav_toc_targets(
     try:
         nav_path = _resolve_manifest_path(base_dir, nav_href)
         nav_root = resources.document(nav_path, xhtml=True)
+    except _ResourceLimitError:
+        raise
     except (KeyError, ConversionError):
         logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
         return [], True
@@ -744,6 +829,7 @@ def _extract_nav_toc_targets(
 
     toc_targets: list[TocTarget] = []
     invalid_destinations = False
+    links = 0
     try:
         nav_base_url = _document_base_url(nav_root, nav_path)
     except ConversionError as e:
@@ -751,7 +837,10 @@ def _extract_nav_toc_targets(
         return [], True
 
     def add_link(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
-        nonlocal invalid_destinations
+        nonlocal invalid_destinations, links
+        links += 1
+        if links > MAX_BOOK_ENTRIES:
+            raise _ResourceLimitError(f"Too many navigation entries: {nav_path}")
         raw_href = elem.attrib.get("href")
         if not raw_href:
             return parent
@@ -809,16 +898,22 @@ def _extract_ncx_toc_targets(
     try:
         ncx_path = _resolve_manifest_path(base_dir, ncx_href)
         ncx_root = resources.document(ncx_path)
+    except _ResourceLimitError:
+        raise
     except (KeyError, ConversionError):
         logger.warning("Unable to read NCX for TOC labels: %s", ncx_path)
         return []
 
     targets: list[TocTarget] = []
+    points = 0
     stack = [(ncx_root, None)]
     while stack:
         elem, parent = stack.pop()
         child_parent = parent
         if _strip_ns(elem.tag) == "navPoint":
+            points += 1
+            if points > MAX_BOOK_ENTRIES:
+                raise _ResourceLimitError(f"Too many navigation entries: {ncx_path}")
             # Only this navPoint's own label/content may describe it. Searching
             # all descendants can accidentally borrow a nested child's values.
             nav_label = next((child for child in elem if _strip_ns(child.tag) == "navLabel"), None)
@@ -845,6 +940,28 @@ def _extract_ncx_toc_targets(
     return targets
 
 
+def _check_zip_compression(info: zipfile.ZipInfo) -> None:
+    if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+        raise ConversionError(
+            f"Unsupported EPUB ZIP compression: {info.filename} (method {info.compress_type}); "
+            "only stored and DEFLATE entries are supported"
+        )
+
+
+def _validate_archive(archive: zipfile.ZipFile) -> None:
+    entries = archive.infolist()
+    if len(entries) > MAX_ARCHIVE_ENTRIES:
+        raise ConversionError(f"EPUB archive has too many entries: {len(entries)} > {MAX_ARCHIVE_ENTRIES}")
+    declared_total = 0
+    for info in entries:
+        _check_zip_compression(info)
+        declared_total += info.file_size
+        if declared_total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise ConversionError(
+                f"EPUB archive declared content too large: exceeds {MAX_ARCHIVE_UNCOMPRESSED_BYTES} bytes"
+            )
+
+
 def _read_zip_member(
     z: zipfile.ZipFile,
     member_path: str,
@@ -862,6 +979,8 @@ def _read_zip_member(
         except KeyError as e:
             raise KeyError(member_path) from e
 
+    _check_zip_compression(info)
+
     if info.file_size > size_limit:
         raise ConversionError(
             f"{kind} too large: {member_path} ({info.file_size} bytes > {size_limit} bytes)"
@@ -876,13 +995,6 @@ def _read_zip_member(
         )
 
     read_errors = (NotImplementedError, RuntimeError, EOFError, UnicodeDecodeError, zlib.error)
-    if info.compress_type == zipfile.ZIP_LZMA:
-        # Like zipfile, allow Python builds without the optional LZMA module.
-        try:
-            from lzma import LZMAError
-        except ImportError as e:
-            raise ConversionError(f"Cannot read EPUB member {member_path}: LZMA support is unavailable") from e
-        read_errors += (LZMAError,)
     try:
         with z.open(info) as member:
             data = member.read(size_limit + 1)
@@ -1008,9 +1120,13 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
     prelude = ""
     body: list[str] = []
     nested = False
+    rule_count = selector_count = 0
     for part, delimiter in _css_parts(text, "{};"):
         if depth == 0:
             if delimiter == "{":
+                rule_count += 1
+                if rule_count > MAX_CSS_RULES:
+                    raise _ResourceLimitError("Too many CSS rules")
                 prelude, body, nested = part.strip(), [], False
                 depth = 1
         else:
@@ -1020,6 +1136,9 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
             elif delimiter == "}":
                 depth -= 1
                 if depth == 0 and not nested and not prelude.startswith("@"):
+                    selector_count += prelude.count(",") + 1
+                    if selector_count > MAX_CSS_SELECTORS:
+                        raise _ResourceLimitError("Too many CSS selectors")
                     declarations = _css_declarations("".join(body) + part)
                     selectors = [selector.strip() for selector in prelude.split(",")]
                     # A selector list containing unsupported syntax is skipped whole.
@@ -1311,8 +1430,12 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
         raise ConversionError("Malformed OPF: missing manifest or spine")
 
     manifest: dict[str, ManifestItem] = {}
+    manifest_count = 0
     for item in list(manifest_node):
         if _strip_ns(item.tag) == "item":
+            manifest_count += 1
+            if manifest_count > MAX_BOOK_ENTRIES:
+                raise _ResourceLimitError(f"Too many manifest entries: {opf_path}")
             iid = item.attrib.get("id")
             href = item.attrib.get("href")
             if iid and href:
@@ -1348,6 +1471,9 @@ class _ResourceReader:
     def __init__(self, archive: zipfile.ZipFile):
         self.archive = archive
         self.bytes_read = 0
+        self.work_bytes = 0
+        self.spine_bytes = 0
+        self.spine_nodes = 0
         # Header offsets identify selected physical entries, including ZIPs
         # containing duplicate filenames. Accounting survives cache eviction.
         self._member_sizes: dict[int, int] = {}
@@ -1365,6 +1491,7 @@ class _ResourceReader:
 
     @staticmethod
     def _check_size(path: str, info: zipfile.ZipInfo, actual: int, size_limit: int, kind: str) -> None:
+        _check_zip_compression(info)
         if max(info.file_size, actual) > size_limit:
             raise ConversionError(f"{kind} too large: {path}")
 
@@ -1378,11 +1505,26 @@ class _ResourceReader:
             self._check_size(path, info, len(data), size_limit, kind)
             self._raw_cache.move_to_end(key)
             return data
+        self._check_size(path, info, 0, size_limit, kind)
+        accounted = self._member_sizes.get(member)
+        aggregate_used = self.bytes_read - (accounted or 0)
+        if aggregate_used + (info.file_size if accounted is None else accounted) > MAX_TOTAL_RESOURCE_BYTES:
+            raise ConversionError(
+                f"EPUB content too large: extracting {path} would exceed {MAX_TOTAL_RESOURCE_BYTES} bytes"
+            )
+        # Reserve both input and output work before opening. Failed reads and
+        # rereads consume work; serving cached bytes or trees does not.
+        work = info.compress_size + info.file_size
+        if self.work_bytes + work > MAX_DECOMPRESSION_WORK_BYTES:
+            raise _ResourceLimitError(
+                f"EPUB decompression work too large: reading {path} would exceed "
+                f"{MAX_DECOMPRESSION_WORK_BYTES} bytes"
+            )
+        self.work_bytes += work
         data, total = _read_zip_member(
             self.archive, path, size_limit=size_limit,
             aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-            aggregate_used=self.bytes_read - self._member_sizes.get(member, 0), kind=kind, info=info,
-            accounted_size=self._member_sizes.get(member),
+            aggregate_used=aggregate_used, kind=kind, info=info, accounted_size=accounted,
         )
         self.bytes_read = total
         self._member_sizes[member] = len(data)
@@ -1403,10 +1545,10 @@ class _ResourceReader:
         key = (path, info.header_offset, xhtml)
         cached = self._documents.get(key)
         if cached is not None:
-            root, source_size, _ = cached
+            root, source_size, nodes = cached
             self._check_size(path, info, source_size, limit, kind)
             self._documents.move_to_end(key)
-            return deepcopy(root) if mutable else root
+            return self._spine_document(root, source_size, nodes, copy=True) if mutable else root
         data = self._read(path, info, size_limit=limit, kind=kind)
         root = _parse_xhtml(data, path) if xhtml else _parse_xml(data, path)
         nodes = sum(1 for _ in root.iter())
@@ -1423,8 +1565,17 @@ class _ResourceReader:
             self._documents[key] = root, len(data), nodes
             self._document_bytes += len(data)
             self._document_nodes += nodes
-            return deepcopy(root) if mutable else root
-        return root
+            return self._spine_document(root, len(data), nodes, copy=True) if mutable else root
+        return self._spine_document(root, len(data), nodes, copy=False) if mutable else root
+
+    def _spine_document(self, root: ET.Element, source_size: int, nodes: int, *, copy: bool) -> ET.Element:
+        # A cached member may appear many times in the spine. Reserve its
+        # processing cost on every occurrence, before retaining another tree.
+        if self.spine_bytes + source_size > MAX_SPINE_BYTES or self.spine_nodes + nodes > MAX_SPINE_ELEMENTS:
+            raise _ResourceLimitError("EPUB spine processing limit exceeded")
+        self.spine_bytes += source_size
+        self.spine_nodes += nodes
+        return deepcopy(root) if copy else root
 
     def omit(self, resource: str, source: str, reason: str) -> None:
         omission = MediaOmission(resource=resource, source=source, reason=reason)
@@ -1467,9 +1618,13 @@ def _report_manifest_omissions(package: _EpubPackage, resources: _ResourceReader
 def _spine_references(spine: ET.Element) -> list[tuple[str, bool]]:
     linear_refs: list[tuple[str, bool]] = []
     auxiliary_refs: list[tuple[str, bool]] = []
+    count = 0
     for itemref in list(spine):
         if _strip_ns(itemref.tag) != "itemref":
             continue
+        count += 1
+        if count > MAX_BOOK_ENTRIES:
+            raise _ResourceLimitError("Too many spine entries")
         rid = itemref.attrib.get("idref")
         if rid:
             linear = itemref.attrib.get("linear", "yes").strip().lower() != "no"
@@ -1656,11 +1811,33 @@ class _StylesheetLoader:
 
     def __init__(self, resources: _ResourceReader):
         self.resources = resources
-        self.cache: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        self.cache: dict[str, tuple[int, list[tuple[str, dict[str, str]]]]] = {}
+        self.cached_selectors = 0
+        self.processed_selectors = 0
+        self.processed_bytes = 0
         self.errors: dict[str, str] = {}
 
     def for_document(self, item: SpineItem) -> _CssStyles:
         rules: list[tuple[str, dict[str, str]]] = []
+        css_bytes = 0
+
+        def reserve(size: int) -> None:
+            nonlocal css_bytes
+            css_bytes += size
+            if css_bytes > MAX_DOCUMENT_CSS_BYTES:
+                raise _ResourceLimitError(f"Document CSS too large: {item.full_path}")
+            if self.processed_bytes + size > MAX_CSS_PROCESSING_BYTES:
+                raise _ResourceLimitError("EPUB CSS processing byte limit exceeded")
+            self.processed_bytes += size
+
+        def add_rules(additional: list[tuple[str, dict[str, str]]]) -> None:
+            if len(rules) + len(additional) > MAX_CSS_SELECTORS:
+                raise _ResourceLimitError(f"Too many document CSS selectors: {item.full_path}")
+            if self.processed_selectors + len(additional) > MAX_CSS_PROCESSING_SELECTORS:
+                raise _ResourceLimitError("EPUB CSS processing selector limit exceeded")
+            self.processed_selectors += len(additional)
+            rules.extend(additional)
+
         stack = [item.document]
         while stack:
             elem = stack.pop()
@@ -1677,9 +1854,11 @@ class _StylesheetLoader:
                 continue
             if elem.tag == "style":
                 text = "".join(elem.itertext())
-                if len(text.encode("utf-8")) > MAX_CSS_BYTES:
+                size = len(text.encode("utf-8"))
+                if size > MAX_CSS_BYTES:
                     raise ConversionError(f"CSS file too large: embedded style in {item.full_path}")
-                rules.extend(_css_rules(text))
+                reserve(size)
+                add_rules(_css_rules(text))
                 continue
             rel = elem.get("rel", "").lower().split()
             href = elem.get("href")
@@ -1696,30 +1875,39 @@ class _StylesheetLoader:
                 continue
             path = resolved[0]
             if path not in self.cache:
-                self.cache[path] = []
+                self.cache[path] = (0, [])
                 try:
                     data = self.resources.read(path, size_limit=MAX_CSS_BYTES, kind="CSS file")
                 except KeyError:
                     self.errors[path] = "stylesheet is missing"
                 else:
+                    reserve(len(data))
+                    self.cache[path] = (len(data), [])
                     try:
                         text = data.decode("utf-8-sig")
                     except UnicodeDecodeError:
                         self.errors[path] = "stylesheet is not UTF-8"
                     else:
-                        self.cache[path] = _css_rules(text)
+                        parsed_rules = _css_rules(text)
+                        if self.cached_selectors + len(parsed_rules) > MAX_CSS_SELECTORS:
+                            raise _ResourceLimitError("Too many cached CSS selectors")
+                        self.cached_selectors += len(parsed_rules)
+                        self.cache[path] = (len(data), parsed_rules)
+            else:
+                reserve(self.cache[path][0])
             if path in self.errors:
                 self.resources.omit(path, item.full_path, self.errors[path])
-            rules.extend(self.cache[path])
+            add_rules(self.cache[path][1])
         return _CssStyles(item.document, rules)
 
 
 def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _SpineIndex,
                   images: _ImageLoader, styles: _StylesheetLoader,
                   ncx_targets: list[TocTarget]) -> tuple[str, list[ResolvedTocEntry]]:
-    parts: list[str] = []
+    parts = _HtmlBuffer()
     fallback_toc: list[ResolvedTocEntry] = []
     for item in spine_items:
+        parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
         sanitizer = MinimalHtmlSanitizer(
             current_path=item.full_path,
             file_anchor_map=index.files,
@@ -1730,6 +1918,7 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
             fragment_anchors=item.fragment_anchors,
             file_anchor=item.anchor,
             styles=styles.for_document(item),
+            output_limit=parts.limit - parts.size,
         )
         clean = sanitizer.sanitize(item.body)
         # Derive fallback labels from the normalized reading text too.
@@ -1744,14 +1933,13 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
             body_snippet = _extract_body_snippet(item.document, package.title)
             chapter_title = body_snippet or chapter_title or item.stem or item.anchor
 
-        parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
         if clean:
             if item.linear:
                 fallback_toc.append(ResolvedTocEntry(item.anchor, chapter_title, item.index))
             parts.append(clean)
             parts.append("<mbp:pagebreak/>")
 
-    return "".join(parts), fallback_toc
+    return parts.text(), fallback_toc
 
 
 def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _SpineIndex) -> tuple[list[ResolvedTocEntry], bool]:
@@ -1835,38 +2023,49 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
     if not filepath.exists():
         raise FileNotFoundError(str(filepath))
 
-    try:
-        archive = zipfile.ZipFile(filepath, "r")
-    except (NotImplementedError, UnicodeDecodeError) as e:
-        raise ConversionError(f"Cannot open EPUB archive {filepath}: {e}") from e
-    with archive:
-        resources = _ResourceReader(archive)
-        package = _read_package(resources)
-        _report_manifest_omissions(package, resources)
-        nav_targets, nav_invalid = _extract_nav_toc_targets(resources, package.manifest, package.base_dir)
-        ncx_targets = _extract_ncx_toc_targets(resources, package.spine, package.manifest, package.base_dir)
-        spine_items, svg_spine_paths = _load_spine(package, resources)
-        index = _index_spine(spine_items)
-        images = _ImageLoader(package, resources)
-        images.load(spine_items, svg_spine_paths)
-        styles = _StylesheetLoader(resources)
-        html_content, fallback_toc = _render_spine(package, spine_items, index, images, styles, ncx_targets)
-        raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index, nav_invalid)
-        toc_entries, toc_depths = _finalize_toc(raw_toc)
+    # Check the same open file that ZipFile will use, before it loads ZIP
+    # metadata. Keep both handles scoped through failures during validation.
+    with filepath.open("rb") as source:
+        archive_size = os.fstat(source.fileno()).st_size
+        if archive_size > MAX_ARCHIVE_BYTES:
+            raise ConversionError(f"EPUB archive too large: {archive_size} bytes > {MAX_ARCHIVE_BYTES} bytes")
+        try:
+            archive = zipfile.ZipFile(source, "r")
+        except (NotImplementedError, UnicodeDecodeError) as e:
+            raise ConversionError(f"Cannot open EPUB archive {filepath}: {e}") from e
+        with archive:
+            _validate_archive(archive)
+            return _parse_archive(archive)
 
-        logger.info("Parsed %d spine items. Title: %s", len(spine_items), package.title)
-        return EpubData(
-            title=package.title,
-            author=package.author,
-            uuid=package.uuid,
-            html_content=html_content,
-            toc_entries=toc_entries,
-            image_records=tuple(images.records),
-            omitted_media=tuple(resources.omissions),
-            language=package.language,
-            cover_index=images.cover_index,
-            toc_depths=toc_depths,
-        )
+
+def _parse_archive(archive: zipfile.ZipFile) -> EpubData:
+    resources = _ResourceReader(archive)
+    package = _read_package(resources)
+    _report_manifest_omissions(package, resources)
+    nav_targets, nav_invalid = _extract_nav_toc_targets(resources, package.manifest, package.base_dir)
+    ncx_targets = _extract_ncx_toc_targets(resources, package.spine, package.manifest, package.base_dir)
+    spine_items, svg_spine_paths = _load_spine(package, resources)
+    index = _index_spine(spine_items)
+    images = _ImageLoader(package, resources)
+    images.load(spine_items, svg_spine_paths)
+    styles = _StylesheetLoader(resources)
+    html_content, fallback_toc = _render_spine(package, spine_items, index, images, styles, ncx_targets)
+    raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index, nav_invalid)
+    toc_entries, toc_depths = _finalize_toc(raw_toc)
+
+    logger.info("Parsed %d spine items. Title: %s", len(spine_items), package.title)
+    return EpubData(
+        title=package.title,
+        author=package.author,
+        uuid=package.uuid,
+        html_content=html_content,
+        toc_entries=toc_entries,
+        image_records=tuple(images.records),
+        omitted_media=tuple(resources.omissions),
+        language=package.language,
+        cover_index=images.cover_index,
+        toc_depths=toc_depths,
+    )
 
 
 class MinimalHtmlSanitizer:
@@ -1881,6 +2080,7 @@ class MinimalHtmlSanitizer:
         fragment_anchors: Optional[dict[str, str]] = None,
         file_anchor: Optional[str] = None,
         styles: Optional[_CssStyles] = None,
+        output_limit: Optional[int] = None,
     ):
         self.current_path = current_path
         self.file_anchor_map = file_anchor_map
@@ -1892,12 +2092,13 @@ class MinimalHtmlSanitizer:
                                  {fragment: target for (path, fragment), target in fragment_anchor_map.items()
                                   if path == current_path})
         self.file_anchor = file_anchor if file_anchor is not None else file_anchor_map.get(current_path)
-        self.fed: list[str] = []
+        self.output_limit = output_limit
+        self.fed = _HtmlBuffer(output_limit)
         self.styles = styles
 
     def _ensure_block_sep(self) -> None:
-        if self.fed:
-            last = self.fed[-1]
+        if self.fed.parts:
+            last = self.fed.parts[-1]
             if last and last[-1] != "\n":
                 self.fed.append("\n")
 
@@ -1950,12 +2151,12 @@ class MinimalHtmlSanitizer:
         return None
 
     def sanitize(self, body: ET.Element) -> str:
-        self.fed = []
+        self.fed = _HtmlBuffer(self.output_limit)
         if self.styles is None or body not in self.styles.styles:
             self.styles = _CssStyles(body, [])
         _normalize_drop_caps(body, self.styles)
         self._emit(body)
-        return "".join(self.fed)
+        return self.fed.text()
 
     def _emit_text(self, text: str, style: dict[str, str]) -> None:
         text = htmlmod.escape(text, quote=False)
@@ -2096,7 +2297,7 @@ class MobiWriter:
 
     @staticmethod
     def _build_toc_html(entries: tuple[tuple[str, str], ...], file_positions: list[int],
-                        depths: tuple[int, ...] = ()) -> str:
+                        depths: tuple[int, ...] = (), *, output_limit: Optional[int] = None) -> str:
         if len(entries) < 2:
             return ""
         if len(entries) != len(file_positions):
@@ -2106,7 +2307,8 @@ class MobiWriter:
             raise ValueError("TOC depth count does not match entry count")
         _toc_parent_indices(depths)
 
-        parts = ["<h1>Table of Contents</h1>"]
+        parts = _HtmlBuffer(output_limit)
+        parts.append("<h1>Table of Contents</h1>")
         current_depth = 0
         for (_, title), filepos, depth in zip(entries, file_positions, depths):
             if filepos < 0 or filepos >= TOC_FILEPOS_MAX:
@@ -2118,7 +2320,7 @@ class MobiWriter:
             current_depth = depth
             parts.append(f'<p><a filepos="{safe_filepos}">{safe_title}</a></p>')
         parts.extend(["</blockquote>"] * current_depth)
-        return "".join(parts)
+        return parts.text()
 
     @staticmethod
     def _build_guide_html(toc_filepos: int) -> str:
@@ -2161,7 +2363,11 @@ class MobiWriter:
         # The MOBI header declares the encoding. An HTML charset declaration
         # becomes stale when browser readers reserialize the decoded DOM as UTF-8.
         prefix_bytes = b"<html><head></head><body>"
+        if len(self.epub.html_content) > MAX_OUTPUT_HTML_BYTES:
+            raise _ResourceLimitError("Generated HTML too large")
         body_bytes = _encode_mobi_text(self.epub.html_content)
+        if len(body_bytes) > MAX_OUTPUT_HTML_BYTES:
+            raise _ResourceLimitError("Generated HTML too large")
         body_bytes, internal_targets = self._prepare_internal_links(body_bytes, self._anchor_positions(body_bytes))
         # Replacements change byte offsets. Scan once more, then share these
         # positions between TOC construction and final fixed-width link values.
@@ -2177,13 +2383,16 @@ class MobiWriter:
             body_start += len(_encode_mobi_text(self._build_guide_html(0)))
             final_positions = [body_start + pos for pos in self._find_anchor_positions(positions)]
             toc_entry_positions = tuple(final_positions)
-            toc_bytes = _encode_mobi_text(self._build_toc_html(self.epub.toc_entries, final_positions,
-                                                              self.epub.toc_depths))
             if not body_bytes.rstrip().endswith(b"<mbp:pagebreak/>"):
                 toc_separator = b"<mbp:pagebreak/>"
+            remaining = MAX_OUTPUT_HTML_BYTES - body_start - len(body_bytes) - len(toc_separator) - len(b"</body></html>")
+            toc_bytes = _encode_mobi_text(self._build_toc_html(self.epub.toc_entries, final_positions,
+                                                              self.epub.toc_depths, output_limit=remaining))
             toc_filepos = body_start + len(body_bytes) + len(toc_separator)
             guide_bytes = _encode_mobi_text(self._build_guide_html(toc_filepos))
 
+        if body_start + len(body_bytes) + len(toc_separator) + len(toc_bytes) + len(b"</body></html>") > MAX_OUTPUT_HTML_BYTES:
+            raise _ResourceLimitError("Generated HTML too large")
         body_bytes = self._finish_internal_links(body_bytes, body_start, internal_targets, positions)
         return TextLayout(
             text_bytes=prefix_bytes + guide_bytes + body_bytes + toc_separator + toc_bytes + b"</body></html>",
