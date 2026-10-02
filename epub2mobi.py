@@ -1696,13 +1696,15 @@ def _spine_references(spine: ET.Element) -> list[tuple[str, bool]]:
 
 def _select_spine_item(item_id: str, package: _EpubPackage, resources: _ResourceReader) -> tuple[str, tuple[str, ...]]:
     chain: list[str] = []
+    visited: set[str] = set()
     current = item_id
     while True:
-        if current in chain:
+        if current in visited:
             raise ConversionError(f"Cyclic manifest fallback chain: {item_id}")
         if current not in package.manifest:
             raise ConversionError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
         chain.append(current)
+        visited.add(current)
         media_type = package.manifest[current].media_type.lower()
         local = _resolve_book_href(package.opf_path, package.manifest[current].href) is not None
         if local and media_type == "application/xhtml+xml":
