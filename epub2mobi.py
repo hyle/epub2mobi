@@ -160,6 +160,59 @@ INDX_INVALID = 0xFFFFFFFF
 INDX_LABEL_ENCODING = 65001  # UTF-8
 
 
+_HTML_BLOCKS: frozenset[str] = frozenset(
+    {
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+        "pre",
+        "ul",
+        "ol",
+        "li",
+        "br",
+        "hr",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "td",
+        "th",
+    }
+)
+_HTML_INLINE: frozenset[str] = frozenset(
+    {"b", "i", "strong", "em", "sup", "sub", "u", "code", "span", "a", "img", "mbp:pagebreak"}
+)
+_HTML_ALLOWED: frozenset[str] = _HTML_BLOCKS | _HTML_INLINE
+_HTML_FLATTENED_BLOCKS: frozenset[str] = frozenset({
+    "dl", "dt", "dd", "section", "article", "aside", "header", "footer",
+    "main", "nav", "figure", "figcaption", "address", "caption", "details",
+    "summary", "hgroup", "form", "fieldset", "legend", "menu",
+})
+_HEADING_HINTS: frozenset[str] = frozenset({"chapter-title", "chap-title", "heading", "chapterhead", "chapter-heading"})
+_CENTER_HINTS: frozenset[str] = frozenset({"center", "centre", "centered", "centred", "epigraph", "ornament", "separator", "scene-break", "scenebreak", "asterism", "dinkus"})
+_RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "credit", "byline", "source"})
+
+
+def _tokenize_hints(*values: str) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        tokens.update(token for token in re.split(r"[^a-z0-9_-]+", value.lower()) if token)
+    return tokens
+
+
+def _has_heading_hint(elem: ET.Element) -> bool:
+    return elem.tag in {"p", "div"} and bool(
+        _tokenize_hints(elem.get("class", ""), elem.get("id", "")) & _HEADING_HINTS
+    )
+
+
 def _strip_ns(tag: str) -> str:
     """Remove XML namespace prefix from tag names."""
     return tag.split("}", 1)[1] if "}" in tag else tag
@@ -187,6 +240,36 @@ class EpubData:
 
 
 @dataclass(frozen=True)
+class ManifestItem:
+    href: str
+    media_type: str
+    properties: str
+    fallback: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _EpubPackage:
+    opf_path: str
+    base_dir: str
+    title: str
+    author: str
+    uuid: str
+    language: Optional[str]
+    metadata: list[ET.Element]
+    manifest: dict[str, ManifestItem]
+    manifest_paths: dict[str, str]
+    spine: ET.Element
+
+
+@dataclass(frozen=True)
+class ResolvedTocEntry:
+    anchor: str
+    label: str
+    spine_index: int
+    depth: int = 0
+
+
+@dataclass(frozen=True)
 class SpineItem:
     index: int
     full_path: str
@@ -198,6 +281,13 @@ class SpineItem:
     body: ET.Element
     fragment_anchors: dict[str, str]
     linear: bool
+
+
+@dataclass(frozen=True)
+class _SpineIndex:
+    files: dict[str, str]
+    fragments: dict[tuple[str, str], str]
+    items: dict[str, SpineItem]
 
 
 @dataclass(frozen=True)
@@ -447,7 +537,7 @@ def _visible_text(root: ET.Element, block_separators: bool = False) -> str:
     text = (root.text or "") + "".join(
         _visible_text(child, block_separators) + (child.tail or "") for child in root
     )
-    blocks = MinimalHtmlSanitizer._BLOCKS | MinimalHtmlSanitizer._FLATTENED_BLOCKS
+    blocks = _HTML_BLOCKS | _HTML_FLATTENED_BLOCKS
     return f" {text} " if block_separators and root.tag in blocks else text
 
 
@@ -566,17 +656,13 @@ def _media_references(body: ET.Element):
 
 def _extract_nav_toc_targets(
     z: zipfile.ZipFile,
-    manifest_hrefs: dict[str, str],
-    manifest_media_types: dict[str, str],
-    manifest_properties: dict[str, str],
+    manifest: dict[str, ManifestItem],
     base_dir: str,
 ) -> list[TocTarget]:
     nav_href = None
-    for item_id, href in manifest_hrefs.items():
-        properties = manifest_properties.get(item_id, "")
-        media_type = manifest_media_types.get(item_id, "")
-        if "nav" in properties.split() and media_type == "application/xhtml+xml":
-            nav_href = href
+    for item in manifest.values():
+        if "nav" in item.properties.split() and item.media_type == "application/xhtml+xml":
+            nav_href = item.href
             break
     if not nav_href:
         return []
@@ -639,22 +725,20 @@ def _extract_nav_toc_targets(
     return toc_targets
 
 
-def _build_ncx_label_map(
+def _extract_ncx_toc_targets(
     z: zipfile.ZipFile,
     spine_node: ET.Element,
-    manifest_hrefs: dict[str, str],
-    manifest_media_types: dict[str, str],
+    manifest: dict[str, ManifestItem],
     base_dir: str,
 ) -> list[TocTarget]:
     ncx_href = None
     toc_id = spine_node.attrib.get("toc")
-    if toc_id:
-        ncx_href = manifest_hrefs.get(toc_id)
+    if toc_id in manifest:
+        ncx_href = manifest[toc_id].href
     if not ncx_href:
-        for item_id, href in manifest_hrefs.items():
-            media_type = manifest_media_types.get(item_id, "")
-            if media_type == "application/x-dtbncx+xml" or href.lower().endswith(".ncx"):
-                ncx_href = href
+        for item in manifest.values():
+            if item.media_type == "application/x-dtbncx+xml" or item.href.lower().endswith(".ncx"):
+                ncx_href = item.href
                 break
     if not ncx_href:
         return []
@@ -907,9 +991,7 @@ class _CssStyles:
             self.font_runs |= bool(local.keys() & {"font-style", "font-weight"})
             style = dict(parent)
             # Semantic markup provides local defaults, which authored CSS can reset.
-            heading_hint = (elem.tag in {"p", "div"} and
-                            MinimalHtmlSanitizer._tokenize_hints(elem.get("class", ""), elem.get("id", ""))
-                            & MinimalHtmlSanitizer._HEADING_HINTS)
+            heading_hint = _has_heading_hint(elem)
             if elem.tag in {"b", "strong", "th", "h1", "h2", "h3", "h4", "h5", "h6"} or heading_hint:
                 style["font-weight"] = "bold"
             if elem.tag in {"i", "em"}:
@@ -1018,8 +1100,7 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
         for initial, paragraph in zip(children, children[1:]):
             if (paragraph.tag != "p" or (initial.tail or "").strip(xml_whitespace)
                     or styles.floats.get(paragraph, "none") != "none"
-                    or MinimalHtmlSanitizer._tokenize_hints(paragraph.get("class", ""), paragraph.get("id", ""))
-                    & MinimalHtmlSanitizer._HEADING_HINTS
+                    or _has_heading_hint(paragraph)
                     or not is_initial(initial)):
                 continue
             continuation = continuation_start(paragraph)
@@ -1088,9 +1169,9 @@ def _metadata_author(metadata: list[ET.Element]) -> str:
     return "Unknown"
 
 
-def _declared_cover_item(metadata: list[ET.Element], manifest_properties: dict[str, str]) -> Optional[str]:
-    for item_id, properties in manifest_properties.items():
-        if "cover-image" in properties.split():
+def _declared_cover_item(metadata: list[ET.Element], manifest: dict[str, ManifestItem]) -> Optional[str]:
+    for item_id, item in manifest.items():
+        if "cover-image" in item.properties.split():
             return item_id
     for elem in metadata:
         if elem.tag in {OPF_NAMESPACE + "meta", "meta"} and elem.get("name") == "cover":
@@ -1107,513 +1188,525 @@ def _raster_signature_matches(data: bytes, media_type: str) -> bool:
     return data.startswith(signatures.get(media_type.lower(), ()))
 
 
-def parse_epub(filepath: Union[str, Path]) -> EpubData:
-    filepath = Path(filepath)
-    if not filepath.exists():
-        raise FileNotFoundError(str(filepath))
-
+def _read_package(z: zipfile.ZipFile) -> _EpubPackage:
     book_title = "Unknown"
     book_author = "Unknown"
     book_uuid = "000000000000"
     book_language = None
 
-    with zipfile.ZipFile(filepath, "r") as z:
-        opf_path, base_dir = _find_opf(z)
+    opf_path, base_dir = _find_opf(z)
+    try:
+        opf_xml = _read_xml_member(z, opf_path)
+    except KeyError as e:
+        raise ValueError(f"OPF declared in container is missing: {opf_path}") from e
+    opf_root = _parse_xml(opf_xml, opf_path)
+
+    unique_id = opf_root.attrib.get("unique-identifier")
+    fallback_uuid = None
+    chosen_uuid = None
+
+    metadata = list(next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ()))
+    titles: list[str] = []
+    for elem in metadata:
+        value = (elem.text or "").strip()
+        if not value:
+            continue
+        if elem.tag == DC_NAMESPACE + "title":
+            titles.append(value)
+        elif elem.tag == DC_NAMESPACE + "language" and not book_language:
+            book_language = value
+        elif elem.tag == DC_NAMESPACE + "identifier":
+            ident = value
+            if ident and not fallback_uuid:
+                fallback_uuid = ident
+            if unique_id and elem.attrib.get("id") == unique_id and ident:
+                chosen_uuid = ident
+
+    if titles:
+        book_title = titles[0]
+    book_author = _metadata_author(metadata)
+    if chosen_uuid:
+        book_uuid = chosen_uuid
+    elif fallback_uuid:
+        book_uuid = fallback_uuid
+
+    manifest_node = None
+    spine_node = None
+    for child in list(opf_root):
+        t = _strip_ns(child.tag)
+        if t == "manifest":
+            manifest_node = child
+        elif t == "spine":
+            spine_node = child
+    if manifest_node is None or spine_node is None:
+        raise ValueError("Malformed OPF: missing manifest or spine")
+
+    manifest: dict[str, ManifestItem] = {}
+    for item in list(manifest_node):
+        if _strip_ns(item.tag) == "item":
+            iid = item.attrib.get("id")
+            href = item.attrib.get("href")
+            if iid and href:
+                # Preserve the existing fallback handling for repeated manifest IDs.
+                previous = manifest.get(iid)
+                manifest[iid] = ManifestItem(
+                    href=href,
+                    media_type=item.get("media-type", ""),
+                    properties=item.get("properties", ""),
+                    fallback=item.get("fallback") or (previous.fallback if previous else None),
+                )
+    manifest_paths = {
+        _resolve_manifest_path(base_dir, item.href): iid
+        for iid, item in manifest.items()
+        if _resolve_book_href(opf_path, item.href) is not None
+    }
+
+    return _EpubPackage(
+        opf_path=opf_path, base_dir=base_dir, title=book_title, author=book_author,
+        uuid=book_uuid, language=book_language, metadata=metadata, manifest=manifest,
+        manifest_paths=manifest_paths, spine=spine_node,
+    )
+
+
+class _ResourceReader:
+    """Own the shared content budget and ordered omission report for one EPUB."""
+
+    def __init__(self, archive: zipfile.ZipFile):
+        self.archive = archive
+        self.bytes_read = 0
+        self.omissions: list[MediaOmission] = []
+        self._seen_omissions: set[MediaOmission] = set()
+
+    def read(self, path: str, *, size_limit: int, kind: str) -> bytes:
+        data, self.bytes_read = _read_zip_member(
+            self.archive, path, size_limit=size_limit,
+            aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
+            aggregate_used=self.bytes_read, kind=kind,
+        )
+        return data
+
+    def omit(self, resource: str, source: str, reason: str) -> None:
+        omission = MediaOmission(resource=resource, source=source, reason=reason)
+        if omission not in self._seen_omissions:
+            self.omissions.append(omission)
+            self._seen_omissions.add(omission)
+
+
+def _report_manifest_omissions(package: _EpubPackage, resources: _ResourceReader) -> None:
+    font_media_types = {
+        "application/font-sfnt", "application/vnd.ms-opentype",
+        "application/x-font-ttf", "application/x-font-otf",
+    }
+    for item in package.manifest.values():
+        href = item.href
+        media_type = item.media_type.lower()
+        resource_path = urllib.parse.urlsplit(href).path.lower()
+        is_font = (
+            media_type.startswith("font/")
+            or media_type in font_media_types
+            or resource_path.endswith((".ttf", ".otf", ".woff", ".woff2"))
+        )
+        if _resolve_book_href(package.opf_path, href) is None:
+            resources.omit(
+                _reported_media_path(package.opf_path, href, href), package.opf_path,
+                "remote or data URI manifest resource is not embedded",
+            )
+        elif is_font:
+            resources.omit(
+                _resolve_manifest_path(package.base_dir, href), package.opf_path,
+                "declared font is not embedded",
+            )
+
+
+def _spine_references(spine: ET.Element) -> list[tuple[str, bool]]:
+    linear_refs: list[tuple[str, bool]] = []
+    auxiliary_refs: list[tuple[str, bool]] = []
+    for itemref in list(spine):
+        if _strip_ns(itemref.tag) != "itemref":
+            continue
+        rid = itemref.attrib.get("idref")
+        if rid:
+            linear = itemref.attrib.get("linear", "yes").strip().lower() != "no"
+            (linear_refs if linear else auxiliary_refs).append((rid, linear))
+    return linear_refs + auxiliary_refs
+
+
+def _select_spine_item(item_id: str, package: _EpubPackage, resources: _ResourceReader) -> tuple[str, tuple[str, ...]]:
+    chain: list[str] = []
+    current = item_id
+    while True:
+        if current in chain:
+            raise ValueError(f"Cyclic manifest fallback chain: {item_id}")
+        if current not in package.manifest:
+            raise ValueError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
+        chain.append(current)
+        media_type = package.manifest[current].media_type.lower()
+        local = _resolve_book_href(package.opf_path, package.manifest[current].href) is not None
+        if local and media_type == "application/xhtml+xml":
+            break
+        fallback = package.manifest[current].fallback
+        if not fallback:
+            if not local:
+                raise ValueError(f"Remote spine content is not supported: {package.manifest[current].href}")
+            if media_type == "image/svg+xml":
+                break  # Retain the existing SVG omission behavior.
+            raise ValueError(f"Unsupported spine media type without readable fallback: {media_type}")
+        current = fallback
+    aliases = tuple(_resolve_manifest_path(package.base_dir, package.manifest[iid].href) for iid in chain
+                    if _resolve_book_href(package.opf_path, package.manifest[iid].href) is not None)
+    for iid in chain[:-1]:
+        resources.omit(_reported_media_path(package.opf_path, package.manifest[iid].href, package.manifest[iid].href),
+                        package.opf_path, "spine resource replaced by manifest fallback")
+    return current, aliases
+
+
+def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list[SpineItem], set[str]]:
+    spine_items: list[SpineItem] = []
+    svg_spine_paths: set[str] = set()
+    for spine_idx, (item_id, linear) in enumerate(_spine_references(package.spine), start=1):
+        item_id, aliases = _select_spine_item(item_id, package, resources)
+        rel = package.manifest[item_id].href
+        full = _resolve_manifest_path(package.base_dir, rel)
+        if package.manifest[item_id].media_type.lower() == "image/svg+xml":
+            svg_spine_paths.add(full)
+            resources.omit(full, package.opf_path, "SVG spine content is not rendered")
         try:
-            opf_xml = _read_xml_member(z, opf_path)
+            raw_bytes = resources.read(full, size_limit=MAX_XHTML_BYTES, kind="Spine XHTML")
         except KeyError as e:
-            raise ValueError(f"OPF declared in container is missing: {opf_path}") from e
-        opf_root = _parse_xml(opf_xml, opf_path)
-
-        unique_id = opf_root.attrib.get("unique-identifier")
-        fallback_uuid = None
-        chosen_uuid = None
-
-        metadata = list(next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ()))
-        titles: list[str] = []
-        for elem in metadata:
-            value = (elem.text or "").strip()
-            if not value:
-                continue
-            if elem.tag == DC_NAMESPACE + "title":
-                titles.append(value)
-            elif elem.tag == DC_NAMESPACE + "language" and not book_language:
-                book_language = value
-            elif elem.tag == DC_NAMESPACE + "identifier":
-                ident = value
-                if ident and not fallback_uuid:
-                    fallback_uuid = ident
-                if unique_id and elem.attrib.get("id") == unique_id and ident:
-                    chosen_uuid = ident
-
-        if titles:
-            book_title = titles[0]
-        book_author = _metadata_author(metadata)
-        if chosen_uuid:
-            book_uuid = chosen_uuid
-        elif fallback_uuid:
-            book_uuid = fallback_uuid
-
-        manifest_node = None
-        spine_node = None
-        for child in list(opf_root):
-            t = _strip_ns(child.tag)
-            if t == "manifest":
-                manifest_node = child
-            elif t == "spine":
-                spine_node = child
-        if manifest_node is None or spine_node is None:
-            raise ValueError("Malformed OPF: missing manifest or spine")
-
-        manifest: dict[str, str] = {}
-        manifest_media_types: dict[str, str] = {}
-        manifest_properties: dict[str, str] = {}
-        manifest_fallbacks: dict[str, str] = {}
-        for item in list(manifest_node):
-            if _strip_ns(item.tag) == "item":
-                iid = item.attrib.get("id")
-                href = item.attrib.get("href")
-                if iid and href:
-                    manifest[iid] = href
-                    manifest_media_types[iid] = item.attrib.get("media-type", "")
-                    manifest_properties[iid] = item.attrib.get("properties", "")
-                    if item.attrib.get("fallback"):
-                        manifest_fallbacks[iid] = item.attrib["fallback"]
-        manifest_paths = {
-            _resolve_manifest_path(base_dir, href): iid
-            for iid, href in manifest.items()
-            if _resolve_book_href(opf_path, href) is not None
-        }
-
-        omissions: list[MediaOmission] = []
-        seen_omissions: set[MediaOmission] = set()
-
-        def record_omission(resource: str, source: str, reason: str) -> None:
-            omission = MediaOmission(resource=resource, source=source, reason=reason)
-            if omission not in seen_omissions:
-                omissions.append(omission)
-                seen_omissions.add(omission)
-
-        font_media_types = {
-            "application/font-sfnt", "application/vnd.ms-opentype",
-            "application/x-font-ttf", "application/x-font-otf",
-        }
-        for item_id, href in manifest.items():
-            media_type = manifest_media_types[item_id].lower()
-            resource_path = urllib.parse.urlsplit(href).path.lower()
-            is_font = (
-                media_type.startswith("font/")
-                or media_type in font_media_types
-                or resource_path.endswith((".ttf", ".otf", ".woff", ".woff2"))
+            raise ValueError(f"Missing spine item in EPUB: {full}") from e
+        document = _parse_xhtml(raw_bytes, full)
+        try:
+            body = _body_element(document)
+        except ValueError as e:
+            raise ValueError(f"Invalid XHTML: {full}: {e}") from e
+        anchor = f"spine_{spine_idx}"
+        body_fragments = tuple(body.get(key) for key in ("id", "name")
+                               if body.tag == "body" and body.get(key))
+        fragment_anchors = {fragment: anchor for fragment in body_fragments}
+        for fragment_idx, fragment in enumerate(_fragment_ids(body), start=1):
+            if fragment not in fragment_anchors:
+                fragment_anchors[fragment] = f"{anchor}_frag_{fragment_idx}"
+        spine_items.append(
+            SpineItem(
+                index=spine_idx,
+                full_path=full,
+                aliases=aliases,
+                base_url=_document_base_url(document, full),
+                anchor=anchor,
+                stem=Path(rel).stem,
+                document=document,
+                body=body,
+                fragment_anchors=fragment_anchors,
+                linear=linear,
             )
-            if _resolve_book_href(opf_path, href) is None:
-                record_omission(
-                    _reported_media_path(opf_path, href, href), opf_path,
-                    "remote or data URI manifest resource is not embedded",
-                )
-            elif is_font:
-                record_omission(
-                    _resolve_manifest_path(base_dir, href), opf_path,
-                    "declared font is not embedded",
-                )
-
-        linear_refs: list[tuple[str, bool]] = []
-        auxiliary_refs: list[tuple[str, bool]] = []
-        for itemref in list(spine_node):
-            if _strip_ns(itemref.tag) != "itemref":
-                continue
-            rid = itemref.attrib.get("idref")
-            if rid:
-                linear = itemref.attrib.get("linear", "yes").strip().lower() != "no"
-                (linear_refs if linear else auxiliary_refs).append((rid, linear))
-        spine_refs = linear_refs + auxiliary_refs
-
-        nav_targets = _extract_nav_toc_targets(
-            z=z,
-            manifest_hrefs=manifest,
-            manifest_media_types=manifest_media_types,
-            manifest_properties=manifest_properties,
-            base_dir=base_dir,
-        )
-        ncx_targets = _build_ncx_label_map(
-            z=z,
-            spine_node=spine_node,
-            manifest_hrefs=manifest,
-            manifest_media_types=manifest_media_types,
-            base_dir=base_dir,
         )
 
-        extracted_resource_bytes = 0
-        spine_items: list[SpineItem] = []
-        svg_spine_paths: set[str] = set()
+    return spine_items, svg_spine_paths
 
-        def select_spine_item(item_id: str) -> tuple[str, tuple[str, ...]]:
-            chain: list[str] = []
-            current = item_id
-            while True:
-                if current in chain:
-                    raise ValueError(f"Cyclic manifest fallback chain: {item_id}")
-                if current not in manifest:
-                    raise ValueError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
-                chain.append(current)
-                media_type = manifest_media_types[current].lower()
-                local = _resolve_book_href(opf_path, manifest[current]) is not None
-                if local and media_type == "application/xhtml+xml":
-                    break
-                fallback = manifest_fallbacks.get(current)
-                if not fallback:
-                    if not local:
-                        raise ValueError(f"Remote spine content is not supported: {manifest[current]}")
-                    if media_type == "image/svg+xml":
-                        break  # Retain the existing SVG omission behavior.
-                    raise ValueError(f"Unsupported spine media type without readable fallback: {media_type}")
-                current = fallback
-            aliases = tuple(_resolve_manifest_path(base_dir, manifest[iid]) for iid in chain
-                            if _resolve_book_href(opf_path, manifest[iid]) is not None)
-            for iid in chain[:-1]:
-                record_omission(_reported_media_path(opf_path, manifest[iid], manifest[iid]),
-                                opf_path, "spine resource replaced by manifest fallback")
-            return current, aliases
 
-        for spine_idx, (item_id, linear) in enumerate(spine_refs, start=1):
-            item_id, aliases = select_spine_item(item_id)
-            rel = manifest[item_id]
-            full = _resolve_manifest_path(base_dir, rel)
-            if manifest_media_types.get(item_id, "").lower() == "image/svg+xml":
-                svg_spine_paths.add(full)
-                record_omission(full, opf_path, "SVG spine content is not rendered")
+def _index_spine(spine_items: list[SpineItem]) -> _SpineIndex:
+    file_anchor_map: dict[str, str] = {}
+    fragment_anchor_map: dict[tuple[str, str], str] = {}
+    spine_by_path: dict[str, SpineItem] = {}
+    # References from other documents to a shared fallback choose its first
+    # occurrence. Each occurrence retains its own markers and self-links.
+    for item in spine_items:
+        for path in item.aliases:
+            spine_by_path.setdefault(path, item)
+            file_anchor_map.setdefault(path, item.anchor)
+            for fragment, anchor in item.fragment_anchors.items():
+                fragment_anchor_map.setdefault((path, fragment), anchor)
+
+    return _SpineIndex(file_anchor_map, fragment_anchor_map, spine_by_path)
+
+
+class _ImageLoader:
+    """Load referenced raster images and declared covers, reusing record indexes."""
+
+    def __init__(self, package: _EpubPackage, resources: _ResourceReader):
+        self.package = package
+        self.resources = resources
+        self.by_path: dict[str, int] = {}
+        self.records: list[bytes] = []
+        self.cover_index: Optional[int] = None
+
+    def embed(self, target_path: str, source: str, item_id: Optional[str] = None,
+              *, cover: bool = False) -> Optional[int]:
+        item_id = item_id if item_id is not None else self.package.manifest_paths.get(target_path)
+        if item_id is None:
+            self.resources.omit(target_path, source, "image is not declared in the EPUB manifest")
+            return None
+        media_type = self.package.manifest[item_id].media_type
+        if not _is_supported_image_media_type(media_type):
+            self.resources.omit(target_path, source, f"unsupported image format: {media_type or 'unspecified'}")
+            return None
+        recindex = self.by_path.get(target_path)
+        if recindex is not None:
+            image_data = self.records[recindex - 1]
+        else:
             try:
-                raw_bytes, extracted_resource_bytes = _read_zip_member(
-                    z,
-                    full,
-                    size_limit=MAX_XHTML_BYTES,
-                    aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-                    aggregate_used=extracted_resource_bytes,
-                    kind="Spine XHTML",
-                )
-            except KeyError as e:
-                raise ValueError(f"Missing spine item in EPUB: {full}") from e
-            document = _parse_xhtml(raw_bytes, full)
-            try:
-                body = _body_element(document)
-            except ValueError as e:
-                raise ValueError(f"Invalid XHTML: {full}: {e}") from e
-            anchor = f"spine_{spine_idx}"
-            body_fragments = tuple(body.get(key) for key in ("id", "name")
-                                   if body.tag == "body" and body.get(key))
-            fragment_anchors = {fragment: anchor for fragment in body_fragments}
-            for fragment_idx, fragment in enumerate(_fragment_ids(body), start=1):
-                if fragment not in fragment_anchors:
-                    fragment_anchors[fragment] = f"{anchor}_frag_{fragment_idx}"
-            spine_items.append(
-                SpineItem(
-                    index=spine_idx,
-                    full_path=full,
-                    aliases=aliases,
-                    base_url=_document_base_url(document, full),
-                    anchor=anchor,
-                    stem=Path(rel).stem,
-                    document=document,
-                    body=body,
-                    fragment_anchors=fragment_anchors,
-                    linear=linear,
-                )
-            )
-
-        file_anchor_map: dict[str, str] = {}
-        fragment_anchor_map: dict[tuple[str, str], str] = {}
-        # References from other documents to a shared fallback choose its first
-        # occurrence. Each occurrence retains its own markers and self-links.
-        for item in spine_items:
-            for path in item.aliases:
-                file_anchor_map.setdefault(path, item.anchor)
-                for fragment, anchor in item.fragment_anchors.items():
-                    fragment_anchor_map.setdefault((path, fragment), anchor)
-
-        image_path_to_recindex: dict[str, int] = {}
-        image_records: list[bytes] = []
-
-        def embed_image(target_path: str, source: str, item_id: Optional[str] = None,
-                        *, cover: bool = False) -> Optional[int]:
-            nonlocal extracted_resource_bytes
-            item_id = item_id if item_id is not None else manifest_paths.get(target_path)
-            if item_id is None:
-                record_omission(target_path, source, "image is not declared in the EPUB manifest")
+                image_data = self.resources.read(target_path, size_limit=MAX_IMAGE_BYTES, kind="Image resource")
+            except KeyError:
+                self.resources.omit(target_path, source, "image file is missing from the EPUB")
                 return None
-            media_type = manifest_media_types.get(item_id, "")
-            if not _is_supported_image_media_type(media_type):
-                record_omission(target_path, source, f"unsupported image format: {media_type or 'unspecified'}")
-                return None
-            recindex = image_path_to_recindex.get(target_path)
-            if recindex is not None:
-                image_data = image_records[recindex - 1]
-            else:
-                try:
-                    image_data, extracted_resource_bytes = _read_zip_member(
-                        z, target_path, size_limit=MAX_IMAGE_BYTES,
-                        aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-                        aggregate_used=extracted_resource_bytes, kind="Image resource",
-                    )
-                except KeyError:
-                    record_omission(target_path, source, "image file is missing from the EPUB")
-                    return None
-            if cover and not _raster_signature_matches(image_data, media_type):
-                record_omission(target_path, source, "cover image signature does not match its declared raster format")
-                return None
-            if recindex is None:
-                image_records.append(image_data)
-                recindex = len(image_records)
-                image_path_to_recindex[target_path] = recindex
-            return recindex
+        if cover and not _raster_signature_matches(image_data, media_type):
+            self.resources.omit(target_path, source, "cover image signature does not match its declared raster format")
+            return None
+        if recindex is None:
+            self.records.append(image_data)
+            recindex = len(self.records)
+            self.by_path[target_path] = recindex
+        return recindex
 
+    def load(self, spine_items: list[SpineItem], svg_spine_paths: set[str]) -> None:
         for item in spine_items:
             image_sources, unsupported, inline_svg = _media_references(item.body)
             if inline_svg and item.full_path not in svg_spine_paths:
-                record_omission("<inline SVG>", item.full_path, "inline SVG is not rendered")
+                self.resources.omit("<inline SVG>", item.full_path, "inline SVG is not rendered")
             for kind, raw_src in unsupported:
                 resource = _reported_media_path(item.full_path, raw_src, f"<{kind}>", item.base_url)
-                record_omission(resource, item.full_path, f"{kind} is not supported")
+                self.resources.omit(resource, item.full_path, f"{kind} is not supported")
 
             for raw_src in image_sources:
                 if not raw_src:
-                    record_omission("<img without src>", item.full_path, "image has no source")
+                    self.resources.omit("<img without src>", item.full_path, "image has no source")
                     continue
                 resolved = _resolve_book_href(item.full_path, raw_src, item.base_url)
                 if resolved is None:
                     resource = _reported_media_path(item.full_path, raw_src, raw_src, item.base_url)
-                    record_omission(resource, item.full_path, "external or data URI image is not embedded")
+                    self.resources.omit(resource, item.full_path, "external or data URI image is not embedded")
                     continue
                 target_path, _fragment = resolved
-                embed_image(target_path, item.full_path)
+                self.embed(target_path, item.full_path)
 
-        cover_index = None
-        cover_id = _declared_cover_item(metadata, manifest_properties)
+        self.cover_index = None
+        cover_id = _declared_cover_item(self.package.metadata, self.package.manifest)
         if cover_id is not None:
-            cover_href = manifest.get(cover_id)
-            if cover_href is None:
-                record_omission(cover_id, opf_path, "cover item is not declared in the EPUB manifest")
+            cover_item = self.package.manifest.get(cover_id)
+            if cover_item is None:
+                self.resources.omit(cover_id, self.package.opf_path, "cover item is not declared in the EPUB manifest")
             else:
-                resolved = _resolve_book_href(opf_path, cover_href)
+                cover_href = cover_item.href
+                resolved = _resolve_book_href(self.package.opf_path, cover_href)
                 if resolved is None:
-                    record_omission(_reported_media_path(opf_path, cover_href, cover_href),
-                                    opf_path, "external or data URI cover is not embedded")
+                    self.resources.omit(_reported_media_path(self.package.opf_path, cover_href, cover_href),
+                                        self.package.opf_path, "external or data URI cover is not embedded")
                 else:
-                    recindex = embed_image(resolved[0], opf_path, cover_id, cover=True)
+                    recindex = self.embed(resolved[0], self.package.opf_path, cover_id, cover=True)
                     if recindex is not None:
-                        cover_index = recindex - 1
+                        self.cover_index = recindex - 1
 
-        css_cache: dict[str, list[tuple[str, dict[str, str]]]] = {}
-        css_errors: dict[str, str] = {}
 
-        def document_styles(item: SpineItem) -> _CssStyles:
-            nonlocal extracted_resource_bytes
-            rules: list[tuple[str, dict[str, str]]] = []
-            stack = [item.document]
-            while stack:
-                elem = stack.pop()
-                # Head styles are intentional; foreign vocabularies and scripts are not.
-                if elem.tag.startswith("{") or elem.tag in {"svg", "script"}:
-                    continue
-                if elem.tag != "style":
-                    stack.extend(reversed(list(elem)))
-                if elem.tag not in {"style", "link"}:
-                    continue
-                if (elem.get("type", "text/css").strip().lower() not in {"", "text/css"}
-                        or elem.get("media", "all").strip().lower() not in {"", "all"}
-                        or "disabled" in elem.attrib):
-                    continue
-                if elem.tag == "style":
-                    text = "".join(elem.itertext())
-                    if len(text.encode("utf-8")) > MAX_CSS_BYTES:
-                        raise ValueError(f"CSS file too large: embedded style in {item.full_path}")
-                    rules.extend(_css_rules(text))
-                    continue
-                rel = elem.get("rel", "").lower().split()
-                href = elem.get("href")
-                if "stylesheet" not in rel or "alternate" in rel or not href:
-                    continue
-                resolved = _resolve_book_href(item.full_path, href, item.base_url)
-                if resolved is None:
-                    record_omission(_reported_media_path(item.full_path, href, href, item.base_url),
+class _StylesheetLoader:
+    """Cache stylesheet reads while reporting failures for each source document."""
+
+    def __init__(self, resources: _ResourceReader):
+        self.resources = resources
+        self.cache: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        self.errors: dict[str, str] = {}
+
+    def for_document(self, item: SpineItem) -> _CssStyles:
+        rules: list[tuple[str, dict[str, str]]] = []
+        stack = [item.document]
+        while stack:
+            elem = stack.pop()
+            # Head styles are intentional; foreign vocabularies and scripts are not.
+            if elem.tag.startswith("{") or elem.tag in {"svg", "script"}:
+                continue
+            if elem.tag != "style":
+                stack.extend(reversed(list(elem)))
+            if elem.tag not in {"style", "link"}:
+                continue
+            if (elem.get("type", "text/css").strip().lower() not in {"", "text/css"}
+                    or elem.get("media", "all").strip().lower() not in {"", "all"}
+                    or "disabled" in elem.attrib):
+                continue
+            if elem.tag == "style":
+                text = "".join(elem.itertext())
+                if len(text.encode("utf-8")) > MAX_CSS_BYTES:
+                    raise ValueError(f"CSS file too large: embedded style in {item.full_path}")
+                rules.extend(_css_rules(text))
+                continue
+            rel = elem.get("rel", "").lower().split()
+            href = elem.get("href")
+            if "stylesheet" not in rel or "alternate" in rel or not href:
+                continue
+            resolved = _resolve_book_href(item.full_path, href, item.base_url)
+            if resolved is None:
+                self.resources.omit(_reported_media_path(item.full_path, href, href, item.base_url),
                                     item.full_path, "external or data URI stylesheet is not loaded")
-                    continue
-                path = resolved[0]
-                if path not in css_cache:
-                    css_cache[path] = []
+                continue
+            path = resolved[0]
+            if path not in self.cache:
+                self.cache[path] = []
+                try:
+                    data = self.resources.read(path, size_limit=MAX_CSS_BYTES, kind="CSS file")
+                except KeyError:
+                    self.errors[path] = "stylesheet is missing"
+                else:
                     try:
-                        data, extracted_resource_bytes = _read_zip_member(
-                            z, path, size_limit=MAX_CSS_BYTES,
-                            aggregate_budget=MAX_TOTAL_RESOURCE_BYTES,
-                            aggregate_used=extracted_resource_bytes, kind="CSS file")
-                    except KeyError:
-                        css_errors[path] = "stylesheet is missing"
+                        text = data.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        self.errors[path] = "stylesheet is not UTF-8"
                     else:
-                        try:
-                            text = data.decode("utf-8-sig")
-                        except UnicodeDecodeError:
-                            css_errors[path] = "stylesheet is not UTF-8"
-                        else:
-                            css_cache[path] = _css_rules(text)
-                if path in css_errors:
-                    record_omission(path, item.full_path, css_errors[path])
-                rules.extend(css_cache[path])
-            return _CssStyles(item.document, rules)
+                        self.cache[path] = _css_rules(text)
+            if path in self.errors:
+                self.resources.omit(path, item.full_path, self.errors[path])
+            rules.extend(self.cache[path])
+        return _CssStyles(item.document, rules)
 
-        parts: list[str] = []
-        fallback_toc: list[tuple[str, str, int, int]] = []
-        for item in spine_items:
-            sanitizer = MinimalHtmlSanitizer(
-                current_path=item.full_path,
-                file_anchor_map=file_anchor_map,
-                fragment_anchor_map=fragment_anchor_map,
-                image_path_to_recindex=image_path_to_recindex,
-                base_url=item.base_url,
-                current_aliases=item.aliases,
-                fragment_anchors=item.fragment_anchors,
-                file_anchor=item.anchor,
-                styles=document_styles(item),
-            )
-            clean = sanitizer.sanitize(item.body)
-            # Derive fallback labels from the normalized reading text too.
-            ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
-            guessed_title = _extract_title(item.document)
-            chapter_title = ncx_title or guessed_title
-            if (
-                not chapter_title
-                or chapter_title.strip().lower() in ("unknown", "untitled")
-                or chapter_title.strip().lower() == book_title.strip().lower()
-            ):
-                body_snippet = _extract_body_snippet(item.document, book_title)
-                chapter_title = body_snippet or chapter_title or item.stem or item.anchor
 
-            parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
-            if clean:
-                if item.linear:
-                    fallback_toc.append((item.anchor, chapter_title, item.index, 0))
-                parts.append(clean)
-                parts.append("<mbp:pagebreak/>")
+def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _SpineIndex,
+                  images: _ImageLoader, styles: _StylesheetLoader,
+                  ncx_targets: list[TocTarget]) -> tuple[str, list[ResolvedTocEntry]]:
+    parts: list[str] = []
+    fallback_toc: list[ResolvedTocEntry] = []
+    for item in spine_items:
+        sanitizer = MinimalHtmlSanitizer(
+            current_path=item.full_path,
+            file_anchor_map=index.files,
+            fragment_anchor_map=index.fragments,
+            image_path_to_recindex=images.by_path,
+            base_url=item.base_url,
+            current_aliases=item.aliases,
+            fragment_anchors=item.fragment_anchors,
+            file_anchor=item.anchor,
+            styles=styles.for_document(item),
+        )
+        clean = sanitizer.sanitize(item.body)
+        # Derive fallback labels from the normalized reading text too.
+        ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
+        guessed_title = _extract_title(item.document)
+        chapter_title = ncx_title or guessed_title
+        if (
+            not chapter_title
+            or chapter_title.strip().lower() in ("unknown", "untitled")
+            or chapter_title.strip().lower() == package.title.strip().lower()
+        ):
+            body_snippet = _extract_body_snippet(item.document, package.title)
+            chapter_title = body_snippet or chapter_title or item.stem or item.anchor
 
-        def resolve_toc_targets(targets: list[TocTarget], source: str) -> tuple[list[tuple[str, str, int, int]], bool]:
-            entries: list[tuple[str, str, int, int]] = []
-            retained: dict[int, Optional[int]] = {}
-            seen_anchors: set[tuple[str, Optional[int]]] = set()
-            unresolved = 0
-            for index, target in enumerate(targets):
-                parent = retained.get(target.parent)
-                # Children of skipped or duplicate nodes attach to the nearest
-                # retained ancestor, never to the previous unrelated branch.
-                retained[index] = parent
-                anchor = (
-                    fragment_anchor_map.get((target.path, target.fragment))
-                    if target.fragment else file_anchor_map.get(target.path)
-                )
-                if anchor is None:
-                    unresolved += 1
-                    continue
-                # A book/part heading and its first chapter may share a target.
-                # Keep references in separate branches; deduplicate siblings.
-                if (anchor, parent) in seen_anchors:
-                    continue
-                spine_item = next((item for item in spine_items if target.path in item.aliases), None)
-                if spine_item is None:
-                    unresolved += 1
-                    continue
-                seen_anchors.add((anchor, parent))
-                depth = entries[parent][3] + 1 if parent is not None else 0
-                retained[index] = len(entries)
-                entries.append((anchor, target.label, spine_item.index, depth))
-            if unresolved:
-                logger.warning("%s TOC: skipped %d unresolved destination%s", source, unresolved,
-                               "" if unresolved == 1 else "s")
-            return entries, bool(unresolved)
+        parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
+        if clean:
+            if item.linear:
+                fallback_toc.append(ResolvedTocEntry(item.anchor, chapter_title, item.index))
+            parts.append(clean)
+            parts.append("<mbp:pagebreak/>")
 
-        nav_toc, nav_incomplete = resolve_toc_targets(nav_targets, "EPUB3 nav")
-        ncx_toc, _ = resolve_toc_targets(ncx_targets, "NCX")
-        # Preserve authored TOCs even when some links are stale. A more complete
-        # NCX can replace an incomplete nav; spine guesses are only a last resort.
-        if nav_toc:
-            raw_toc = ncx_toc if nav_incomplete and len(ncx_toc) > len(nav_toc) else nav_toc
+    return "".join(parts), fallback_toc
+
+
+def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _SpineIndex) -> tuple[list[ResolvedTocEntry], bool]:
+    entries: list[ResolvedTocEntry] = []
+    retained: dict[int, Optional[int]] = {}
+    seen_anchors: set[tuple[str, Optional[int]]] = set()
+    unresolved = 0
+    for index, target in enumerate(targets):
+        parent = retained.get(target.parent)
+        # Children of skipped or duplicate nodes attach to the nearest
+        # retained ancestor, never to the previous unrelated branch.
+        retained[index] = parent
+        anchor = (
+            spine_index.fragments.get((target.path, target.fragment))
+            if target.fragment else spine_index.files.get(target.path)
+        )
+        if anchor is None:
+            unresolved += 1
+            continue
+        # A book/part heading and its first chapter may share a target.
+        # Keep references in separate branches; deduplicate siblings.
+        if (anchor, parent) in seen_anchors:
+            continue
+        spine_item = spine_index.items.get(target.path)
+        if spine_item is None:
+            unresolved += 1
+            continue
+        seen_anchors.add((anchor, parent))
+        depth = entries[parent].depth + 1 if parent is not None else 0
+        retained[index] = len(entries)
+        entries.append(ResolvedTocEntry(anchor, target.label, spine_item.index, depth))
+    if unresolved:
+        logger.warning("%s TOC: skipped %d unresolved destination%s", source, unresolved,
+                       "" if unresolved == 1 else "s")
+    return entries, bool(unresolved)
+
+
+def _select_toc(nav_targets: list[TocTarget], ncx_targets: list[TocTarget],
+                fallback_toc: list[ResolvedTocEntry], index: _SpineIndex) -> list[ResolvedTocEntry]:
+    nav_toc, nav_incomplete = _resolve_toc_targets(nav_targets, "EPUB3 nav", index)
+    ncx_toc, _ = _resolve_toc_targets(ncx_targets, "NCX", index)
+    # Preserve authored TOCs even when some links are stale. A more complete
+    # NCX can replace an incomplete nav; spine guesses are only a last resort.
+    if nav_toc:
+        raw_toc = ncx_toc if nav_incomplete and len(ncx_toc) > len(nav_toc) else nav_toc
+    else:
+        raw_toc = ncx_toc or fallback_toc
+
+    return raw_toc
+
+
+def _finalize_toc(raw_toc: list[ResolvedTocEntry]) -> tuple[tuple[tuple[str, str], ...], tuple[int, ...]]:
+    toc_depths = tuple(entry.depth for entry in raw_toc)
+    parents = _toc_parent_indices(toc_depths)
+    label_counts: dict[tuple[Optional[int], str], int] = {}
+    for entry, parent in zip(raw_toc, parents):
+        key = (parent, entry.label)
+        label_counts[key] = label_counts.get(key, 0) + 1
+
+    toc_entries: list[tuple[str, str]] = []
+    used_labels: set[tuple[Optional[int], str]] = set()
+    for entry, parent in zip(raw_toc, parents):
+        # Repeated labels in different books/sections are already distinct
+        # through their parents; only siblings need disambiguation.
+        if label_counts[(parent, entry.label)] > 1:
+            resolved = f"{entry.label} ({entry.spine_index})"
         else:
-            raw_toc = ncx_toc or fallback_toc
+            resolved = entry.label
 
-        toc_depths = tuple(depth for _, _, _, depth in raw_toc)
-        parents = _toc_parent_indices(toc_depths)
-        label_counts: dict[tuple[Optional[int], str], int] = {}
-        for (_, label, _, _), parent in zip(raw_toc, parents):
-            key = (parent, label)
-            label_counts[key] = label_counts.get(key, 0) + 1
+        if (parent, resolved) in used_labels:
+            resolved = f"Chapter {entry.spine_index}"
+        used_labels.add((parent, resolved))
+        toc_entries.append((entry.anchor, resolved))
 
-        toc_entries: list[tuple[str, str]] = []
-        used_labels: set[tuple[Optional[int], str]] = set()
-        for (anchor, label, spine_idx, _), parent in zip(raw_toc, parents):
-            # Repeated labels in different books/sections are already distinct
-            # through their parents; only siblings need disambiguation.
-            if label_counts[(parent, label)] > 1:
-                resolved = f"{label} ({spine_idx})"
-            else:
-                resolved = label
+    return tuple(toc_entries), toc_depths
 
-            if (parent, resolved) in used_labels:
-                resolved = f"Chapter {spine_idx}"
-            used_labels.add((parent, resolved))
-            toc_entries.append((anchor, resolved))
 
-        html_content = "".join(parts)
-        logger.info("Parsed %d spine items. Title: %s", len(spine_items), book_title)
+def parse_epub(filepath: Union[str, Path]) -> EpubData:
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(str(filepath))
+
+    with zipfile.ZipFile(filepath, "r") as archive:
+        package = _read_package(archive)
+        resources = _ResourceReader(archive)
+        _report_manifest_omissions(package, resources)
+        nav_targets = _extract_nav_toc_targets(archive, package.manifest, package.base_dir)
+        ncx_targets = _extract_ncx_toc_targets(archive, package.spine, package.manifest, package.base_dir)
+        spine_items, svg_spine_paths = _load_spine(package, resources)
+        index = _index_spine(spine_items)
+        images = _ImageLoader(package, resources)
+        images.load(spine_items, svg_spine_paths)
+        styles = _StylesheetLoader(resources)
+        html_content, fallback_toc = _render_spine(package, spine_items, index, images, styles, ncx_targets)
+        raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index)
+        toc_entries, toc_depths = _finalize_toc(raw_toc)
+
+        logger.info("Parsed %d spine items. Title: %s", len(spine_items), package.title)
         return EpubData(
-            title=book_title,
-            author=book_author,
-            uuid=book_uuid,
+            title=package.title,
+            author=package.author,
+            uuid=package.uuid,
             html_content=html_content,
-            toc_entries=tuple(toc_entries),
-            image_records=tuple(image_records),
-            omitted_media=tuple(omissions),
-            language=book_language,
-            cover_index=cover_index,
+            toc_entries=toc_entries,
+            image_records=tuple(images.records),
+            omitted_media=tuple(resources.omissions),
+            language=package.language,
+            cover_index=images.cover_index,
             toc_depths=toc_depths,
         )
 
 
 class MinimalHtmlSanitizer:
-    _BLOCKS: frozenset[str] = frozenset(
-        {
-            "p",
-            "div",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "blockquote",
-            "pre",
-            "ul",
-            "ol",
-            "li",
-            "br",
-            "hr",
-            "table",
-            "thead",
-            "tbody",
-            "tfoot",
-            "tr",
-            "td",
-            "th",
-        }
-    )
-    _INLINE: frozenset[str] = frozenset(
-        {"b", "i", "strong", "em", "sup", "sub", "u", "code", "span", "a", "img", "mbp:pagebreak"}
-    )
-    _ALLOWED: frozenset[str] = _BLOCKS | _INLINE
-    _FLATTENED_BLOCKS: frozenset[str] = frozenset({
-        "dl", "dt", "dd", "section", "article", "aside", "header", "footer",
-        "main", "nav", "figure", "figcaption", "address", "caption", "details",
-        "summary", "hgroup", "form", "fieldset", "legend", "menu",
-    })
-    _HEADING_HINTS: frozenset[str] = frozenset({"chapter-title", "chap-title", "heading", "chapterhead", "chapter-heading"})
-    _CENTER_HINTS: frozenset[str] = frozenset({"center", "centre", "centered", "centred", "epigraph", "ornament", "separator", "scene-break", "scenebreak", "asterism", "dinkus"})
-    _RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "credit", "byline", "source"})
-
     def __init__(
         self,
         current_path: str,
@@ -1646,13 +1739,6 @@ class MinimalHtmlSanitizer:
                 self.fed.append("\n")
 
     @staticmethod
-    def _tokenize_hints(*values: str) -> set[str]:
-        tokens: set[str] = set()
-        for value in values:
-            tokens.update(token for token in re.split(r"[^a-z0-9_-]+", value.lower()) if token)
-        return tokens
-
-    @staticmethod
     def _derive_alignment(style: str, hint_tokens: set[str]) -> Optional[str]:
         # This is a fallback hint, not margin layout: require the final complete
         # value on each side to be exactly auto, without interpreting lengths.
@@ -1660,9 +1746,9 @@ class MinimalHtmlSanitizer:
                    if name in {"margin-left", "margin-right"}}
         if margins.get("margin-left") == margins.get("margin-right") == "auto":
             return "center"
-        if hint_tokens & MinimalHtmlSanitizer._CENTER_HINTS:
+        if hint_tokens & _CENTER_HINTS:
             return "center"
-        if hint_tokens & MinimalHtmlSanitizer._RIGHT_HINTS:
+        if hint_tokens & _RIGHT_HINTS:
             return "right"
         return None
 
@@ -1729,9 +1815,9 @@ class MinimalHtmlSanitizer:
                 for child in elem.iter()
             )
         table_tag = tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
-        output_tag = tag if tag in self._ALLOWED and not (flatten_table and table_tag) else None
-        hints = self._tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
-        if output_tag in {"p", "div"} and hints & self._HEADING_HINTS:
+        output_tag = tag if tag in _HTML_ALLOWED and not (flatten_table and table_tag) else None
+        hints = _tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
+        if output_tag in {"p", "div"} and _has_heading_hint(elem):
             output_tag = "h2"
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
         if self.styles.font_runs and output_tag in {"b", "i"}:
@@ -1758,18 +1844,18 @@ class MinimalHtmlSanitizer:
                 href = self._rewrite_href(attrs["href"])
                 if href:
                     attr_str = f' href="{htmlmod.escape(href, quote=True)}"'
-            elif output_tag in self._BLOCKS:
+            elif output_tag in _HTML_BLOCKS:
                 align = style.get("text-align") or self._derive_alignment(attrs.get("style", ""), hints)
                 if align:
                     attr_str = f' align="{align}"'
                 if output_tag in {"p", "div", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"} and "text-indent" in style:
                     attr_str += f' width="{style["text-indent"]}"'
-            if output_tag in self._BLOCKS:
+            if output_tag in _HTML_BLOCKS:
                 self._ensure_block_sep()
             self.fed.append(f"<{output_tag}{attr_str}>")
         elif table_tag:
             self.fed.append(" ")
-        elif tag in self._FLATTENED_BLOCKS:
+        elif tag in _HTML_FLATTENED_BLOCKS:
             self._ensure_block_sep()
         if elem.text:
             self._emit_text(elem.text, style)
@@ -1779,11 +1865,11 @@ class MinimalHtmlSanitizer:
                 self._emit_text(child.tail, style)
         if output_tag:
             self.fed.append(f"</{output_tag}>")
-            if output_tag in self._BLOCKS:
+            if output_tag in _HTML_BLOCKS:
                 self.fed.append("\n")
         elif table_tag:
             self.fed.append("\n" if tag in {"tr", "table"} else " ")
-        elif tag in self._FLATTENED_BLOCKS:
+        elif tag in _HTML_FLATTENED_BLOCKS:
             self._ensure_block_sep()
 
 
@@ -2146,8 +2232,6 @@ class MobiWriter:
                 b = data[i]
                 if b == 0x00 or 0x09 <= b <= 0x7F:
                     break
-                if i + 1 < n and b == 0x20 and 0x40 <= data[i + 1] <= 0x7F:
-                    break
                 # First byte already proved non-backref by the outer loop check.
                 if run and MobiWriter._best_backref(data, i)[1] >= 3:
                     break
@@ -2246,8 +2330,8 @@ class MobiWriter:
         return bytes(exth)
 
     @staticmethod
-    def _compute_record_indices(text_rec_count: int, nav_rec_count: int) -> tuple[int, int]:
-        flis_idx = 1 + text_rec_count + nav_rec_count
+    def _compute_record_indices(text_rec_count: int, following_rec_count: int) -> tuple[int, int]:
+        flis_idx = 1 + text_rec_count + following_rec_count
         return flis_idx, flis_idx + 1
 
     def _build_record0(
@@ -2407,8 +2491,7 @@ class MobiWriter:
         )
         nav_index_idx = 1 + len(text_records) if nav_records else None
         first_image_idx = 1 + len(text_records) + len(nav_records) if image_records else None
-        first_nonbook_candidates = [idx for idx in (nav_index_idx, first_image_idx, flis_idx) if idx is not None]
-        first_nonbook = min(first_nonbook_candidates)
+        first_nonbook = 1 + len(text_records)
         record0 = self._build_record0(
             uncompressed_text_len=len(text_bytes),
             text_rec_count=len(text_records),
