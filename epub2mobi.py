@@ -65,6 +65,9 @@ MOBI_TEXT_ENCODING_NAME = "windows-1252"
 TOC_FILEPOS_WIDTH = 10
 TOC_FILEPOS_MAX = 10 ** TOC_FILEPOS_WIDTH
 
+# Match browser URL whitespace handling before classifying emitted links.
+_URL_TRIM_CHARACTERS = "".join(chr(code) for code in range(33))
+
 # XML parsing guardrails for untrusted EPUBs
 MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_XHTML_BYTES = 16 * 1024 * 1024
@@ -2129,13 +2132,21 @@ class MinimalHtmlSanitizer:
                 self.fed.append(marker)
 
     def _rewrite_href(self, href: str) -> Optional[str]:
+        href = href.replace("\t", "").replace("\n", "").replace("\r", "").strip(_URL_TRIM_CHARACTERS)
         try:
             resolved = _resolve_book_href(self.current_path, href, self.base_url)
+            if resolved is None:
+                external = _split_epub_url(urllib.parse.urljoin(self.base_url, href))
+                # A network-path link needs an explicit scheme in the MOBI;
+                # otherwise a reader could inherit its local file scheme.
+                if not external.scheme and external.netloc:
+                    external = external._replace(scheme="https")
+                if external.scheme in {"http", "https", "mailto"}:
+                    return external.geturl()
+                return None
         except ConversionError as e:
             logger.warning("Skipped invalid link in %s: %s: %s", self.current_path, href, e)
             return None
-        if resolved is None:
-            return urllib.parse.urljoin(self.base_url, href)
 
         target_path, fragment = resolved
         if fragment:
