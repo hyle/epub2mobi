@@ -52,13 +52,17 @@ Options can be combined. Use `--help` for the CLI reference.
 
 Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
-Missing or unsupported media are skipped and reported. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
+Missing, empty, or unsupported media are skipped and reported. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
 
 ## Navigation and metadata
 
 EPUB3 navigation is preferred. A more complete NCX can replace an incomplete nav; a spine-based TOC is generated only when no authored destinations resolve. Unresolved destinations produce warnings while valid entries and their hierarchy remain. Children of skipped entries attach to the nearest retained ancestor.
 
 Books with multiple TOC entries also get a linked TOC at the end, with a guide link for readers that use it for navigation. If the logical MOBI TOC exceeds its supported record size, it is omitted with a warning and the in-book TOC remains.
+
+An unambiguous EPUB3 `bodymatter` landmark supplies the MOBI start-reading hint (EXTH 116); an EPUB2 guide reference with `type="text"` is used if no usable landmark resolves. Document and fragment destinations follow the same paths and fallback aliases as internal navigation. Repeated references to the same retained anchor are accepted; distinct destinations within one source are ambiguous. Invalid, external, missing, or ambiguous starts produce warnings without blocking conversion. Unresolved fragments are not repaired to chapter beginnings. With no usable authored start, no hint is added; content order is unchanged. Readers may ignore the hint or use a saved reading position.
+
+External links allow only `http`, `https`, and `mailto` after resolving the document's base URL. Other schemes, including `javascript`, `data`, and `file`, lose their `href` while retaining text, formatting, and anchor targets. URI whitespace is normalized before resolution. Links beginning with `//host/` inherit an HTTP(S) base scheme, or become HTTPS when no scheme is present.
 
 The first nonempty Dublin Core title is used. Creator order is preserved, with names joined by `; `. Known EPUB2/EPUB3 MARC roles select authors and creators without a recognized role. Unknown roles retain their credits; if all creators have recognized non-author roles, all are retained with a warning. The recognized role list is bundled.
 
@@ -76,8 +80,11 @@ Styles come from XHTML `<style>` blocks, local UTF-8 stylesheets (an optional BO
 | `font-weight` | `normal`, `bold`, `100`–`900` (600 and above render as bold) |
 | `text-align` | `left`, `right`, `center`, `justify` |
 | `text-indent` | `0`, nonnegative lengths in `em` or `pt` |
+| `display` | `none` suppresses reading content; recognized ordinary display values reset it without emulating layout |
 
-Precedence is **inline style > class rule > element rule**, separately for each property. Later declarations win ties in document order. Properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
+Precedence is **inline style > class rule > element rule**, separately for each property. Later declarations win ties in document order. Text properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
+
+An element with a `hidden` attribute (regardless of its value), supported `display:none`, or a hidden ancestor is excluded from reading content. Hidden inline images are not loaded; hidden fragments cannot supply TOC or reading-start destinations. Text outside a hidden subtree is retained. `display` does not inherit unless requested with `inherit`; `initial` and `unset` reset it. A child cannot undo an ancestor's hiddenness. Hidden navigation metadata remains available, and a declared cover is handled independently.
 
 Common class/ID hints and valid inline auto margins provide alignment when no supported CSS alignment applies. Compound, descendant, ID, and pseudo selectors, other properties, `!important`, and at-rule blocks such as `@import` and `@media` are skipped. Alternate or disabled stylesheets, and those whose `media` is neither empty nor `all`, are skipped. Missing, remote, or non-UTF-8 stylesheets are reported.
 
@@ -87,7 +94,11 @@ Covers must be declared local JPEG, PNG, or GIF resources with matching file sig
 
 ## Input and output handling
 
-Relative links and media honor the first XHTML `base` with an `href`, including URL-encoded paths. Parent references within the EPUB are allowed; traversal above the archive root is rejected, including encoded and backslash forms. Invalid required package or spine paths stop conversion; invalid optional links and resources are skipped and reported. Repeated spine documents retain independent formatting and self-links; links from other documents to a shared path target its first occurrence.
+Relative links and media honor the first XHTML `base` with an `href`, including URL-encoded paths. Parent references within the EPUB are allowed; traversal above the archive root is rejected, including encoded and backslash forms. Invalid required package or spine paths stop conversion; invalid optional links and resources are skipped and reported. Repeated spine documents retain independent formatting and self-links; links from other documents to a shared path target its first occurrence. Repeated source IDs keep all text and target the first retained occurrence, emitting each generated anchor once.
+
+Duplicate manifest IDs and declarations resolving to the same local resource path are rejected; queries and fragments do not distinguish local resources. Shared fallback targets and repeated spine references are supported. ZIP member names are checked without repairing paths: controls, absolute paths, backslashes, empty or dot segments, exact duplicates, and file/directory conflicts are rejected. Names differing only by case or Unicode canonical normalization produce one warning per archive; exact names remain distinct for lookup.
+
+Fallback relationships are checked only when needed to select spine content. Broken unused chains do not block conversion, and readable local XHTML is accepted even if its unused fallback is broken. Missing targets or cycles stop conversion when encountered while selecting a chapter.
 
 XHTML is parsed as XML, preserving namespaces, CDATA, and empty elements. Standard XHTML entities in documents declaring an external DTD are resolved locally in text and attributes. Malformed XML, unknown entities, custom entity declarations, and processing-limit violations are rejected. No external DTD is fetched.
 
@@ -112,7 +123,7 @@ Size and processing limits keep malformed or unusually large books from consumin
 | XML / spine XHTML document | 8 MiB / 16 MiB |
 | XML structure per document | 100,000 elements, 200,000 attributes, depth 256 (root depth zero) |
 | XML attribute names and values | 65,536 characters each; namespace declarations count as attributes |
-| Manifest / spine / each navigation document | 10,000 entries each, before filtering duplicates or invalid entries |
+| Manifest / spine / each navigation document | 10,000 entries each, counting raw declarations before validation or filtering |
 | Spine processing | 64 MiB of source data and 1,000,000 elements, counting every occurrence |
 | Image or cover | 64 MiB each |
 | Style block or stylesheet | 1 MiB, 10,000 top-level rules, 50,000 selectors |
