@@ -52,7 +52,7 @@ Options can be combined. Use `--help` for the CLI reference.
 
 Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
-Missing, empty, or unsupported media are skipped and reported. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
+Missing, empty, or unsupported media are skipped and reported. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
 
 ## Navigation and metadata
 
