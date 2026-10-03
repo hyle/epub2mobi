@@ -52,7 +52,7 @@ Options can be combined. Use `--help` for the CLI reference.
 
 Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
-Missing, empty, or unsupported media are skipped and reported. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
+Missing, empty, or unsupported media are skipped and reported. Raster images with mismatched signatures are also omitted. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
 
 ## Navigation and metadata
 
@@ -92,7 +92,7 @@ Common class/ID hints and valid inline auto margins provide alignment when no su
 
 Ordered lists with `start`, `reversed`, or `type`, or items with `value` or `type`, use explicit labels in indented blocks. This preserves numbering without depending on legacy readers' support for those attributes. Ordinary lists keep native markup. Only retained direct items count; hidden items neither advance nor reset the sequence. Decimal, letter (`a`/`A`), and Roman (`i`/`I`) labels are supported. Letters for nonpositive numbers and Roman labels outside 1–3999 fall back to decimal. Invalid numbering attributes, including integers exceeding 64 digits, are ignored with one warning per affected list. CSS counters and `list-style-type` remain unsupported.
 
-Covers must be declared local JPEG, PNG, or GIF resources with matching file signatures. EPUB3 `cover-image` takes precedence over EPUB2 cover metadata. Image data are copied without resizing or thumbnail generation; no cover page is inserted.
+Inline raster images and covers must be declared local JPEG, PNG, or GIF resources with signatures matching their declared media types. This is a header check, not full image validation; pixels are not decoded. EPUB3 `cover-image` takes precedence over EPUB2 cover metadata. Image data are copied without resizing or thumbnail generation; no cover page is inserted.
 
 ## Input and output handling
 
