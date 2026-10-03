@@ -2301,6 +2301,84 @@ class MinimalHtmlSanitizer:
         self.fed = _HtmlBuffer(output_limit)
         self.styles = styles
         self.emitted_anchors: set[str] = set()
+        self.list_layout: dict[ET.Element, tuple[Optional[str], str]] = {}
+
+    @staticmethod
+    def _list_label(number: int, kind: str) -> str:
+        if kind in {"a", "A"} and number > 0:
+            letters = []
+            while number:
+                number, digit = divmod(number - 1, 26)
+                letters.append(chr(ord("a") + digit))
+            label = "".join(reversed(letters))
+            return label.upper() if kind == "A" else label
+        if kind in {"i", "I"} and 0 < number < 4000:
+            letters = []
+            for value, letter in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+                                  (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+                                  (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+                count, number = divmod(number, value)
+                letters.append(letter * count)
+            label = "".join(letters)
+            return label.lower() if kind == "i" else label
+        return str(number)
+
+    def _ordered_list_layout(self, body: ET.Element) -> dict[ET.Element, tuple[Optional[str], str]]:
+        """Lower custom numbering to visible labels without native list markers."""
+        layout: dict[ET.Element, tuple[Optional[str], str]] = {}
+        label_bytes = 0
+        for ordered in _visible_elements(body):
+            if ordered.tag != "ol":
+                continue
+            items = [child for child in ordered if child.tag == "li"]
+            if (not {"start", "reversed", "type"} & ordered.attrib.keys()
+                    and not any({"value", "type"} & item.attrib.keys() for item in items)):
+                continue
+            invalid = False
+
+            def integer(value: str, default: int) -> int:
+                nonlocal invalid
+                # Bound big-integer work; ordinary book numbering is tiny.
+                value = value.strip()
+                if re.fullmatch(r"[+-]?[0-9]{1,64}", value):
+                    return int(value)
+                invalid = True
+                return default
+
+            def marker_type(value: str, default: str) -> str:
+                nonlocal invalid
+                value = value.strip()
+                if value in {"1", "a", "A", "i", "I"}:
+                    return value
+                invalid = True
+                return default
+
+            step = -1 if "reversed" in ordered.attrib else 1
+            number = len(items) if step == -1 else 1
+            if "start" in ordered.attrib:
+                number = integer(ordered.attrib["start"], number)
+            kind = marker_type(ordered.get("type", "1"), "1")
+            layout[ordered] = ("blockquote", "")
+            for item in items:
+                if "value" in item.attrib:
+                    number = integer(item.attrib["value"], number)
+                item_kind = marker_type(item.get("type", kind), kind)
+                label = self._list_label(number, item_kind) + ". "
+                label_bytes += len(label)  # All generated labels are ASCII.
+                if label_bytes > self.fed.limit:
+                    raise _ResourceLimitError("Generated HTML too large")
+                target = item
+                # Keep a label on the first paragraph's line, avoiding nested
+                # paragraphs and preserving the original nodes and anchors.
+                while not (target.text or "").strip() and len(target) and target[0].tag in {"p", "div"}:
+                    target = target[0]
+                layout[item] = ("div", label if target is item else "")
+                if target is not item:
+                    layout[target] = (None, label)
+                number += step
+            if invalid:
+                logger.warning("Invalid or oversized ordered-list numbering in %s; ignored invalid attributes", self.current_path)
+        return layout
 
     def _ensure_block_sep(self) -> None:
         if self.fed.parts:
@@ -2374,6 +2452,7 @@ class MinimalHtmlSanitizer:
         if not _prune_hidden_body(body, self.styles):
             return ""
         _normalize_drop_caps(body, self.styles)
+        self.list_layout = self._ordered_list_layout(body)
         self._emit(body)
         return self.fed.text()
 
@@ -2415,6 +2494,9 @@ class MinimalHtmlSanitizer:
             # Native MOBI headings/header cells impose bold on descendants.
             # Ordinary blocks/cells allow normal-weight runs to reset it.
             output_tag = "td" if output_tag == "th" else "p"
+        replacement, list_label = self.list_layout.get(elem, (None, ""))
+        if replacement:
+            output_tag = replacement
         if tag == "img":
             src = attrs.get("src", "")
             try:
@@ -2449,6 +2531,8 @@ class MinimalHtmlSanitizer:
             self.fed.append(" ")
         elif tag in _HTML_FLATTENED_BLOCKS:
             self._ensure_block_sep()
+        if list_label:
+            self._emit_text(list_label, style)
         if elem.text:
             self._emit_text(elem.text, style)
         for child in elem:
