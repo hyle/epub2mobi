@@ -3241,22 +3241,33 @@ def deploy_to_kindle(source_file: str) -> None:
                 candidates.append(letter + ":\\")
             bitmask >>= 1
 
+    matches: dict[str, str] = {}
     for path in candidates:
         docs = os.path.join(path, "documents")
         if not os.path.isdir(docs):
             continue
         if "Kindle" not in os.path.basename(path) and not os.path.exists(os.path.join(path, "system")):
             continue
-        dest = os.path.join(docs, os.path.basename(source_file))
-        # Actual copy failures propagate to main(), which returns a failure
-        # status. The completed local conversion remains available for retry.
-        with _atomic_output(dest) as destination:
-            with open(source_file, "rb") as source:
-                shutil.copyfileobj(source, destination)
-        logger.info("Copied to Kindle: %s", dest)
-        return
+        # Discovery may visit the same mount more than once or through an alias.
+        matches.setdefault(os.path.normcase(os.path.realpath(path)), path)
 
-    logger.warning("No Kindle detected.")
+    if not matches:
+        logger.warning("No Kindle detected.")
+        return
+    if len(matches) > 1:
+        raise ConversionError(
+            f"Multiple Kindles detected ({', '.join(sorted(matches.values()))}); "
+            "disconnect extra devices or copy the local MOBI manually"
+        )
+
+    path = next(iter(matches.values()))
+    dest = os.path.join(path, "documents", os.path.basename(source_file))
+    # Actual copy failures propagate to main(), which returns a failure
+    # status. The completed local conversion remains available for retry.
+    with _atomic_output(dest) as destination:
+        with open(source_file, "rb") as source:
+            shutil.copyfileobj(source, destination)
+    logger.info("Copied to Kindle: %s", dest)
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:

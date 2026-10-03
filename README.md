@@ -32,6 +32,8 @@ Copy the result to a connected Kindle over USB:
 python3 epub2mobi.py my_book.epub --deploy
 ```
 
+Automatic deployment copies only when exactly one Kindle matches. Multiple matches produce an error before copying; the local MOBI remains available for manual transfer. Duplicate paths and symlink aliases count as one match.
+
 List omitted media and the reasons:
 
 ```bash
