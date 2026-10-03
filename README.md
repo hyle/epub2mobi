@@ -1,6 +1,6 @@
 # epub2mobi.py
 
-`epub2mobi.py` is a single-script, zero-dependency Python tool that converts EPUB files to legacy MOBI6 for older Kindle devices.
+`epub2mobi.py` is a single-file, zero-dependency Python CLI tool that converts EPUB files to legacy MOBI6 for older Kindle devices.
 
 Just grab the script, run it from the command line, and breathe new life into an old e-reader. It focuses on readable text, basic formatting, and working navigation.
 
