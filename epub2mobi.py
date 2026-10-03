@@ -2424,6 +2424,8 @@ class MinimalHtmlSanitizer:
             recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
             if recindex is not None:
                 self.fed.append(f'<img recindex="{recindex}"/>')
+            elif attrs.get("alt", "").strip():
+                self._emit_text(attrs["alt"], style)
             return
         if output_tag in {"br", "hr", "mbp:pagebreak"}:
             self.fed.append(f"<{output_tag}/>")
