@@ -1902,11 +1902,12 @@ class _ImageLoader:
             except KeyError:
                 self.resources.omit(target_path, source, "image file is missing from the EPUB")
                 return None
-        if cover and not _raster_signature_matches(image_data, media_type):
-            self.resources.omit(target_path, source, "cover image signature does not match its declared raster format")
-            return None
         if not image_data:
             self.resources.omit(target_path, source, "image file is empty")
+            return None
+        if not _raster_signature_matches(image_data, media_type):
+            kind = "cover image" if cover else "image"
+            self.resources.omit(target_path, source, f"{kind} signature does not match its declared raster format")
             return None
         if recindex is None:
             self.records.append(image_data)
