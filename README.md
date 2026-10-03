@@ -90,6 +90,8 @@ Common class/ID hints and valid inline auto margins provide alignment when no su
 
 `float` is inspected only to repair detached text drop caps. A left-floating initial can join the immediately following paragraph when its continuation starts with a lowercase or uncased letter and the structure makes the join unambiguous. Formatting, accents, and link targets are preserved; the initial becomes ordinary inline text. Explicit spaces at the join, including nonbreaking spaces, prevent joining; XML newline indentation may be removed when joining is safe. Image initials and CSS-generated letters are not reconstructed, and general float layout is unsupported.
 
+Ordered lists with `start`, `reversed`, or `type`, or items with `value` or `type`, use explicit labels in indented blocks. This preserves numbering without depending on legacy readers' support for those attributes. Ordinary lists keep native markup. Only retained direct items count; hidden items neither advance nor reset the sequence. Decimal, letter (`a`/`A`), and Roman (`i`/`I`) labels are supported. Letters for nonpositive numbers and Roman labels outside 1–3999 fall back to decimal. Invalid numbering attributes, including integers exceeding 64 digits, are ignored with one warning per affected list. CSS counters and `list-style-type` remain unsupported.
+
 Covers must be declared local JPEG, PNG, or GIF resources with matching file signatures. EPUB3 `cover-image` takes precedence over EPUB2 cover metadata. Image data are copied without resizing or thumbnail generation; no cover page is inserted.
 
 ## Input and output handling
