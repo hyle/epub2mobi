@@ -30,7 +30,7 @@ from copy import deepcopy
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import contextmanager
 from datetime import datetime
 from html.entities import name2codepoint
@@ -310,6 +310,7 @@ class SpineItem:
     body: ET.Element
     fragment_anchors: dict[str, str]
     linear: bool
+    styles: Optional[_CssStyles] = None
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1157,13 @@ def _css_parts(text: str, separators: str):
 
 def _css_value(property_name: str, value: str) -> Optional[str]:
     value = value.strip().lower()
+    if property_name == "display":
+        # Inspect visibility only; these values never introduce layout rules.
+        if value in {"none", "inherit", "initial", "unset", "block", "inline", "inline-block",
+                     "list-item", "contents", "flow-root", "flex", "inline-flex", "grid", "inline-grid",
+                     "table", "inline-table", "table-row", "table-cell", "table-row-group",
+                     "table-header-group", "table-footer-group", "table-column", "table-column-group", "table-caption"}:
+            return value
     # Float is inspected only to recognize detached text initials, not rendered.
     if property_name == "float":
         if value in {"left", "right", "none", "inherit"}:
@@ -1245,7 +1253,7 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
 
 
 class _CssStyles:
-    """Resolve supported text properties and a non-inherited drop-cap float hint."""
+    """Resolve text styles, rendered hiddenness, and the drop-cap float hint."""
 
     def __init__(self, document: ET.Element, rules: list[tuple[str, dict[str, str]]]):
         by_selector: dict[str, dict[str, tuple[int, str]]] = {}
@@ -1254,11 +1262,11 @@ class _CssStyles:
             target.update((name, (order, value)) for name, value in declarations.items())
         self.styles: dict[ET.Element, dict[str, str]] = {}
         self.floats: dict[ET.Element, str] = {}
+        self.hidden: set[ET.Element] = set()
         self.font_runs = False
 
-        def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none") -> None:
-            if _suppressed_element(elem):
-                return
+        def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
+                    parent_hidden: bool = False, parent_display: str = "initial") -> None:
             chosen = {name: (0, order, value)
                       for name, (order, value) in by_selector.get(elem.tag, {}).items()}
             for cls in set(elem.get("class", "").split()):
@@ -1268,11 +1276,19 @@ class _CssStyles:
                         chosen[name] = candidate
             local = {name: value for name, (_, _, value) in chosen.items()}
             local.update(_css_declarations(elem.get("style", "")))
+            display = local.pop("display", "initial")
+            if display == "inherit":
+                display = parent_display
+            hidden = parent_hidden or "hidden" in elem.attrib or display == "none"
+            if hidden:
+                self.hidden.add(elem)
+            if _suppressed_element(elem):
+                return
             floating = local.pop("float", "none")
             if floating == "inherit":
                 floating = parent_float
             self.floats[elem] = floating
-            self.font_runs |= bool(local.keys() & {"font-style", "font-weight"})
+            self.font_runs |= not hidden and bool(local.keys() & {"font-style", "font-weight"})
             style = dict(parent)
             # Semantic markup provides local defaults, which authored CSS can reset.
             heading_hint = _has_heading_hint(elem)
@@ -1288,9 +1304,42 @@ class _CssStyles:
                     style[name] = value
             self.styles[elem] = style
             for child in elem:
-                resolve(child, style, floating)
+                resolve(child, style, floating, hidden, display)
 
         resolve(document, {})
+
+
+def _prune_hidden_body(body: ET.Element, styles: _CssStyles) -> bool:
+    """Retain reading content, preserving tails outside removed subtrees."""
+    if body in styles.hidden:
+        return False
+    if not styles.hidden:
+        return True
+    stack = [body]
+    while stack:
+        parent = stack.pop()
+        retained = []
+        tails: dict[Optional[ET.Element], list[str]] = {}
+        for child in parent:
+            if child in styles.hidden:
+                if child.tail:
+                    previous = retained[-1] if retained else None
+                    tails.setdefault(previous, []).append(child.tail)
+            else:
+                retained.append(child)
+                stack.append(child)
+        for previous, parts in tails.items():
+            if previous is None:
+                parent.text = (parent.text or "") + "".join(parts)
+            else:
+                previous.tail = (previous.tail or "") + "".join(parts)
+        parent[:] = retained
+    # The retained tree now carries visibility for all downstream consumers.
+    for elem in styles.hidden:
+        styles.styles.pop(elem, None)
+        styles.floats.pop(elem, None)
+    styles.hidden.clear()
+    return True
 
 
 def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
@@ -1790,12 +1839,6 @@ def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list
         except ConversionError as e:
             raise ConversionError(f"Invalid XHTML: {full}: {e}") from e
         anchor = f"spine_{spine_idx}"
-        body_fragments = tuple(body.get(key) for key in ("id", "name")
-                               if body.tag == "body" and body.get(key))
-        fragment_anchors = {fragment: anchor for fragment in body_fragments}
-        for fragment_idx, fragment in enumerate(_fragment_ids(body), start=1):
-            if fragment not in fragment_anchors:
-                fragment_anchors[fragment] = f"{anchor}_frag_{fragment_idx}"
         spine_items.append(
             SpineItem(
                 index=spine_idx,
@@ -1806,7 +1849,7 @@ def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list
                 stem=Path(rel).stem,
                 document=document,
                 body=body,
-                fragment_anchors=fragment_anchors,
+                fragment_anchors={},
                 linear=linear,
             )
         )
@@ -1861,6 +1904,9 @@ class _ImageLoader:
                 return None
         if cover and not _raster_signature_matches(image_data, media_type):
             self.resources.omit(target_path, source, "cover image signature does not match its declared raster format")
+            return None
+        if not image_data:
+            self.resources.omit(target_path, source, "image file is empty")
             return None
         if recindex is None:
             self.records.append(image_data)
@@ -2010,8 +2056,23 @@ class _StylesheetLoader:
         return _CssStyles(item.document, rules)
 
 
+def _prepare_spine(spine_items: list[SpineItem], loader: _StylesheetLoader) -> list[SpineItem]:
+    retained: list[SpineItem] = []
+    for item in spine_items:
+        styles = loader.for_document(item)
+        if not _prune_hidden_body(item.body, styles):
+            continue
+        body_fragments = tuple(item.body.get(key) for key in ("id", "name")
+                               if item.body.tag == "body" and item.body.get(key))
+        anchors = {fragment: item.anchor for fragment in body_fragments}
+        for fragment_idx, fragment in enumerate(_fragment_ids(item.body), start=1):
+            anchors.setdefault(fragment, f"{item.anchor}_frag_{fragment_idx}")
+        retained.append(replace(item, fragment_anchors=anchors, styles=styles))
+    return retained
+
+
 def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _SpineIndex,
-                  images: _ImageLoader, styles: _StylesheetLoader,
+                  images: _ImageLoader,
                   ncx_targets: list[TocTarget]) -> tuple[str, list[ResolvedTocEntry]]:
     parts = _HtmlBuffer()
     fallback_toc: list[ResolvedTocEntry] = []
@@ -2026,7 +2087,7 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
             current_aliases=item.aliases,
             fragment_anchors=item.fragment_anchors,
             file_anchor=item.anchor,
-            styles=styles.for_document(item),
+            styles=item.styles,
             output_limit=parts.limit - parts.size,
         )
         clean = sanitizer.sanitize(item.body)
@@ -2188,11 +2249,11 @@ def _parse_archive(archive: zipfile.ZipFile) -> EpubData:
     nav_targets, nav_invalid, nav_starts = _extract_nav_targets(resources, package.manifest, package.base_dir)
     ncx_targets = _extract_ncx_toc_targets(resources, package.spine, package.manifest, package.base_dir)
     spine_items, svg_spine_paths = _load_spine(package, resources)
+    spine_items = _prepare_spine(spine_items, _StylesheetLoader(resources))
     index = _index_spine(spine_items)
     images = _ImageLoader(package, resources)
     images.load(spine_items, svg_spine_paths)
-    styles = _StylesheetLoader(resources)
-    html_content, fallback_toc = _render_spine(package, spine_items, index, images, styles, ncx_targets)
+    html_content, fallback_toc = _render_spine(package, spine_items, index, images, ncx_targets)
     raw_toc = _select_toc(nav_targets, ncx_targets, fallback_toc, index, nav_invalid)
     toc_entries, toc_depths = _finalize_toc(raw_toc)
 
@@ -2239,6 +2300,7 @@ class MinimalHtmlSanitizer:
         self.output_limit = output_limit
         self.fed = _HtmlBuffer(output_limit)
         self.styles = styles
+        self.emitted_anchors: set[str] = set()
 
     def _ensure_block_sep(self) -> None:
         if self.fed.parts:
@@ -2267,10 +2329,11 @@ class MinimalHtmlSanitizer:
                 continue
             seen.add(value)
             target = self.fragment_anchors.get(value)
-            if target:
+            if target and target not in self.emitted_anchors:
                 marker = (f'<span id="{target}"></span>' if in_link else
                           f'<a name="{target}" id="{target}"></a>')
                 self.fed.append(marker)
+                self.emitted_anchors.add(target)
 
     def _rewrite_href(self, href: str) -> Optional[str]:
         href = href.replace("\t", "").replace("\n", "").replace("\r", "").strip(_URL_TRIM_CHARACTERS)
@@ -2304,8 +2367,12 @@ class MinimalHtmlSanitizer:
 
     def sanitize(self, body: ET.Element) -> str:
         self.fed = _HtmlBuffer(self.output_limit)
+        # The spine's file marker is emitted before this sanitizer runs.
+        self.emitted_anchors = {self.file_anchor} if self.file_anchor else set()
         if self.styles is None or body not in self.styles.styles:
             self.styles = _CssStyles(body, [])
+        if not _prune_hidden_body(body, self.styles):
+            return ""
         _normalize_drop_caps(body, self.styles)
         self._emit(body)
         return self.fed.text()
@@ -2995,6 +3062,8 @@ class MobiWriter:
         curr = offset_base
         uid = 1
         for rec in records:
+            if not rec:
+                raise ConversionError("Cannot write an empty MOBI record")
             rec_info.extend(struct.pack(">I", curr))
             rec_info.append(0x00)
             rec_info.extend(struct.pack(">I", uid)[1:])
