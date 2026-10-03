@@ -102,9 +102,11 @@ EXTH_SOURCE = 112
 EXTH_ASIN = 113
 EXTH_CDETYPE = 501  # EBOK/PDOC
 EXTH_COVER_OFFSET = 201
+EXTH_START_READING = 116
 
 DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
 OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
+EPUB_NAMESPACE = "{http://www.idpf.org/2007/ops}"
 
 # Recognized MARC relators, including discontinued codes found in older EPUBs.
 # Source: https://www.loc.gov/marc/relators/relacode.html (checked 2026-10-01).
@@ -262,6 +264,7 @@ class EpubData:
     language: Optional[str] = None
     cover_index: Optional[int] = None  # Zero-based offset among image_records.
     toc_depths: tuple[int, ...] = ()  # Preorder depths; empty means a flat TOC.
+    reading_start_anchor: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +287,7 @@ class _EpubPackage:
     manifest: dict[str, ManifestItem]
     manifest_paths: dict[str, str]
     spine: ET.Element
+    guide: Optional[ET.Element] = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +324,14 @@ class TextLayout:
     text_bytes: bytes
     toc_entry_positions: tuple[int, ...]
     body_end: int  # Excludes the generated TOC and closing HTML tags.
+    reading_start_offset: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ReadingStart:
+    path: str
+    fragment: Optional[str]
+    source: str
 
 
 @dataclass(frozen=True)
@@ -795,18 +807,32 @@ def _media_references(body: ET.Element):
     return images, unsupported, inline_svg
 
 
-def _extract_nav_toc_targets(
+def _reading_start_target(current_path: str, href: Optional[str], source: str,
+                          base_url: Optional[str] = None) -> Optional[ReadingStart]:
+    try:
+        if not href:
+            raise ConversionError("missing href")
+        resolved = _resolve_book_href(current_path, href, base_url)
+        if resolved is None:
+            raise ConversionError("external destination")
+    except ConversionError as e:
+        logger.warning("%s reading start: ignored %r: %s", source, href, e)
+        return None
+    return ReadingStart(resolved[0], resolved[1], source)
+
+
+def _extract_nav_targets(
     resources: _ResourceReader,
     manifest: dict[str, ManifestItem],
     base_dir: str,
-) -> tuple[list[TocTarget], bool]:
+) -> tuple[list[TocTarget], bool, list[ReadingStart]]:
     nav_href = None
     for item in manifest.values():
         if "nav" in item.properties.split() and item.media_type == "application/xhtml+xml":
             nav_href = item.href
             break
     if not nav_href:
-        return [], False
+        return [], False, []
 
     nav_path = nav_href
     try:
@@ -816,7 +842,28 @@ def _extract_nav_toc_targets(
         raise
     except (KeyError, ConversionError):
         logger.warning("Unable to read EPUB3 nav document: %s", nav_path)
-        return [], True
+        return [], True, []
+
+    try:
+        nav_base_url = _document_base_url(nav_root, nav_path)
+    except ConversionError as e:
+        logger.warning("Unable to resolve EPUB3 nav base: %s: %s", nav_path, e)
+        return [], True, []
+
+    reading_starts: list[ReadingStart] = []
+    stack = [(nav_root, False)]
+    while stack:
+        elem, landmarks = stack.pop()
+        if _suppressed_element(elem):
+            continue
+        if elem.tag == "nav":
+            landmarks = "landmarks" in elem.get(EPUB_NAMESPACE + "type", "").split()
+        # Hidden landmarks are still navigation metadata. No label is needed.
+        if landmarks and elem.tag == "a" and "bodymatter" in elem.get(EPUB_NAMESPACE + "type", "").split():
+            target = _reading_start_target(nav_path, elem.get("href"), "EPUB3 bodymatter", nav_base_url)
+            if target is not None:
+                reading_starts.append(target)
+        stack.extend((child, landmarks) for child in reversed(list(elem)))
 
     toc_nav = None
     for elem in _visible_elements(nav_root):
@@ -832,16 +879,11 @@ def _extract_nav_toc_targets(
             toc_nav = elem
             break
     if toc_nav is None:
-        return [], False
+        return [], False, reading_starts
 
     toc_targets: list[TocTarget] = []
     invalid_destinations = False
     links = 0
-    try:
-        nav_base_url = _document_base_url(nav_root, nav_path)
-    except ConversionError as e:
-        logger.warning("Unable to resolve EPUB3 nav base: %s: %s", nav_path, e)
-        return [], True
 
     def add_link(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
         nonlocal invalid_destinations, links
@@ -880,7 +922,7 @@ def _extract_nav_toc_targets(
         link = next((child for child in elem if child.tag == "a"), None) if elem.tag == "li" else None
         child_parent = add_link(link, parent) if link is not None else parent
         stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not link)
-    return toc_targets, invalid_destinations
+    return toc_targets, invalid_destinations, reading_starts
 
 
 def _extract_ncx_toc_targets(
@@ -1473,12 +1515,15 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
 
     manifest_node = None
     spine_node = None
+    guide_node = None
     for child in list(opf_root):
         t = _strip_ns(child.tag)
         if t == "manifest":
             manifest_node = child
         elif t == "spine":
             spine_node = child
+        elif t == "guide" and guide_node is None:
+            guide_node = child
     if manifest_node is None or spine_node is None:
         raise ConversionError("Malformed OPF: missing manifest or spine")
 
@@ -1523,7 +1568,7 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
     return _EpubPackage(
         opf_path=opf_path, base_dir=base_dir, title=book_title, author=book_author,
         uuid=book_uuid, language=book_language, metadata=metadata, manifest=manifest,
-        manifest_paths=manifest_paths, spine=spine_node,
+        manifest_paths=manifest_paths, spine=spine_node, guide=guide_node,
     )
 
 
@@ -2041,6 +2086,40 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
     return entries, bool(unresolved)
 
 
+def _resolve_reading_start(targets: list[ReadingStart], index: _SpineIndex) -> Optional[str]:
+    anchors: set[str] = set()
+    unresolved = 0
+    for target in targets:
+        item = index.items.get(target.path)
+        anchor = (index.fragments.get((target.path, target.fragment)) if target.fragment
+                  else index.files.get(target.path))
+        if anchor is None or item is None or _suppressed_element(item.body):
+            unresolved += 1
+        else:
+            anchors.add(anchor)
+    if unresolved:
+        logger.warning("%s reading start: ignored %d unresolved destination(s)", targets[0].source, unresolved)
+    if len(anchors) > 1:
+        logger.warning("%s reading start: ignored ambiguous destinations", targets[0].source)
+        return None
+    return next(iter(anchors), None)
+
+
+def _select_reading_start(nav_starts: list[ReadingStart], package: _EpubPackage,
+                         index: _SpineIndex) -> Optional[str]:
+    anchor = _resolve_reading_start(nav_starts, index)
+    if anchor is not None or package.guide is None:
+        return anchor
+    guide_starts: list[ReadingStart] = []
+    for reference in package.guide:
+        if _strip_ns(reference.tag) != "reference" or reference.get("type") != "text":
+            continue
+        target = _reading_start_target(package.opf_path, reference.get("href"), "EPUB2 guide")
+        if target is not None:
+            guide_starts.append(target)
+    return _resolve_reading_start(guide_starts, index)
+
+
 def _select_toc(nav_targets: list[TocTarget], ncx_targets: list[TocTarget],
                 fallback_toc: list[ResolvedTocEntry], index: _SpineIndex,
                 nav_invalid: bool = False) -> list[ResolvedTocEntry]:
@@ -2106,7 +2185,7 @@ def _parse_archive(archive: zipfile.ZipFile) -> EpubData:
     resources = _ResourceReader(archive)
     package = _read_package(resources)
     _report_manifest_omissions(package, resources)
-    nav_targets, nav_invalid = _extract_nav_toc_targets(resources, package.manifest, package.base_dir)
+    nav_targets, nav_invalid, nav_starts = _extract_nav_targets(resources, package.manifest, package.base_dir)
     ncx_targets = _extract_ncx_toc_targets(resources, package.spine, package.manifest, package.base_dir)
     spine_items, svg_spine_paths = _load_spine(package, resources)
     index = _index_spine(spine_items)
@@ -2129,6 +2208,7 @@ def _parse_archive(archive: zipfile.ZipFile) -> EpubData:
         language=package.language,
         cover_index=images.cover_index,
         toc_depths=toc_depths,
+        reading_start_anchor=_select_reading_start(nav_starts, package, index),
     )
 
 
@@ -2466,10 +2546,18 @@ class MobiWriter:
         if body_start + len(body_bytes) + len(toc_separator) + len(toc_bytes) + len(b"</body></html>") > MAX_OUTPUT_HTML_BYTES:
             raise _ResourceLimitError("Generated HTML too large")
         body_bytes = self._finish_internal_links(body_bytes, body_start, internal_targets, positions)
+        reading_start_offset = None
+        if self.epub.reading_start_anchor is not None:
+            position = positions.get(_encode_mobi_text(self.epub.reading_start_anchor))
+            if position is None:
+                logger.warning("Authored reading start was not retained in MOBI HTML; opening hint omitted")
+            else:
+                reading_start_offset = body_start + position
         return TextLayout(
             text_bytes=prefix_bytes + guide_bytes + body_bytes + toc_separator + toc_bytes + b"</body></html>",
             toc_entry_positions=toc_entry_positions,
             body_end=body_start + len(body_bytes),
+            reading_start_offset=reading_start_offset,
         )
 
     @staticmethod
@@ -2745,7 +2833,7 @@ class MobiWriter:
     def _build_eof() -> bytes:
         return b"\xE9\x8E\x0D\x0A"
 
-    def _build_exth(self) -> bytes:
+    def _build_exth(self, *, reading_start_offset: Optional[int] = None) -> bytes:
         payload = bytearray()
         count = 0
 
@@ -2760,6 +2848,10 @@ class MobiWriter:
         add(EXTH_TITLE, _encode_meta(self.epub.title))
         add(EXTH_SOURCE, _encode_meta(self.epub.uuid))
         add(EXTH_CDETYPE, b"EBOK")
+        if reading_start_offset is not None:
+            if not 0 <= reading_start_offset < 2**32:
+                raise ValueError("Reading start offset is outside the MOBI text range")
+            add(EXTH_START_READING, struct.pack(">I", reading_start_offset))
 
         asin = f"B{_crc32_u32(self.epub.uuid):08X}".encode("ascii")
         add(EXTH_ASIN, asin)
@@ -2794,6 +2886,7 @@ class MobiWriter:
         first_nonbook: int,
         nav_index_idx: Optional[int],
         first_image_idx: Optional[int],
+        reading_start_offset: Optional[int] = None,
     ) -> bytes:
         # PalmDOC
         palmdoc = bytearray(PALMDOC_LEN)
@@ -2838,7 +2931,7 @@ class MobiWriter:
         struct.pack_into(">I", mobi, OFF_EXTH_FLAGS, flags | 0x40)
 
         # Assemble Record 0
-        exth = self._build_exth()
+        exth = self._build_exth(reading_start_offset=reading_start_offset)
         record0 = bytearray()
         record0.extend(palmdoc)
         record0.extend(mobi)
@@ -2951,6 +3044,7 @@ class MobiWriter:
             first_nonbook=first_nonbook,
             nav_index_idx=nav_index_idx,
             first_image_idx=first_image_idx,
+            reading_start_offset=layout.reading_start_offset,
         )
 
         records: list[bytes] = [record0]
