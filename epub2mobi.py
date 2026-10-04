@@ -337,7 +337,7 @@ class ReadingStart:
 
 @dataclass(frozen=True)
 class TocTarget:
-    path: str
+    path: Optional[str]  # None for an unlinked EPUB3 grouping heading.
     fragment: Optional[str]
     label: str
     parent: Optional[int] = None  # Index of the parent in this source's target list.
@@ -822,6 +822,32 @@ def _reading_start_target(current_path: str, href: Optional[str], source: str,
     return ReadingStart(resolved[0], resolved[1], source)
 
 
+def _navigation_label(elem: ET.Element) -> str:
+    """Lower a navigation label to text without loading its embedded media."""
+    parts: list[str] = []
+
+    def visit(node: ET.Element) -> None:
+        tag = _strip_ns(node.tag)
+        if tag in {"script", "style", "head"}:
+            return
+        if tag in {"img", "svg", "audio", "video", "object", "embed", "iframe", "canvas"}:
+            alternative = node.get("alt", "")
+            if not alternative.strip():
+                alternative = node.get("title", "")
+            if not alternative.strip() and tag == "svg":
+                title = next((child for child in node if _strip_ns(child.tag) == "title"), None)
+                alternative = _visible_text(title) if title is not None else ""
+            parts.append(alternative)
+            return
+        parts.append(node.text or "")
+        for child in node:
+            visit(child)
+            parts.append(child.tail or "")
+
+    visit(elem)
+    return " ".join("".join(parts).split()) or " ".join(elem.get("title", "").split())
+
+
 def _extract_nav_targets(
     resources: _ResourceReader,
     manifest: dict[str, ManifestItem],
@@ -884,18 +910,22 @@ def _extract_nav_targets(
 
     toc_targets: list[TocTarget] = []
     invalid_destinations = False
-    links = 0
+    navigation_entries = 0
 
-    def add_link(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
-        nonlocal invalid_destinations, links
-        links += 1
-        if links > MAX_BOOK_ENTRIES:
+    def add_target(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
+        nonlocal invalid_destinations, navigation_entries
+        navigation_entries += 1
+        if navigation_entries > MAX_BOOK_ENTRIES:
             raise _ResourceLimitError(f"Too many navigation entries: {nav_path}")
+        label = _navigation_label(elem)
+        if not label:
+            return parent
+        if elem.tag == "span":
+            index = len(toc_targets)
+            toc_targets.append(TocTarget(path=None, fragment=None, label=label, parent=parent))
+            return index
         raw_href = elem.attrib.get("href")
         if not raw_href:
-            return parent
-        label = " ".join(_visible_text(elem).split())
-        if not label:
             return parent
         try:
             resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
@@ -916,13 +946,12 @@ def _extract_nav_targets(
         if _suppressed_element(elem):
             continue
         if elem.tag == "a":
-            add_link(elem, parent)
+            add_target(elem, parent)
             continue
-        # The leading link labels this list item; nested lists belong to it.
-        # Non-linked grouping spans leave descendants under the nearest link.
-        link = next((child for child in elem if child.tag == "a"), None) if elem.tag == "li" else None
-        child_parent = add_link(link, parent) if link is not None else parent
-        stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not link)
+        # The leading link or grouping span labels this item's nested lists.
+        heading = next((child for child in elem if child.tag in {"a", "span"}), None) if elem.tag == "li" else None
+        child_parent = add_target(heading, parent) if heading is not None else parent
+        stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not heading)
     return toc_targets, invalid_destinations, reading_starts
 
 
@@ -2114,31 +2143,39 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
 
 
 def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _SpineIndex) -> tuple[list[ResolvedTocEntry], bool]:
+    destinations: list[Optional[tuple[str, SpineItem]]] = []
+    unresolved = 0
+    for target in targets:
+        if target.path is None:
+            destinations.append(None)
+            continue
+        anchor = (spine_index.fragments.get((target.path, target.fragment))
+                  if target.fragment else spine_index.files.get(target.path))
+        item = spine_index.items.get(target.path)
+        destination = (anchor, item) if anchor is not None and item is not None else None
+        destinations.append(destination)
+        unresolved += destination is None
+
+    # Give unlinked groups their first retained descendant's destination.
+    # A reverse pass handles nested groups and skipped links in linear work.
+    first_destinations = destinations.copy()
+    for index in range(len(targets) - 1, -1, -1):
+        parent = targets[index].parent
+        if parent is not None and destinations[parent] is None and first_destinations[index] is not None:
+            first_destinations[parent] = first_destinations[index]
+
     entries: list[ResolvedTocEntry] = []
     retained: dict[int, Optional[int]] = {}
-    seen_anchors: set[tuple[str, Optional[int]]] = set()
-    unresolved = 0
     for index, target in enumerate(targets):
         parent = retained.get(target.parent)
-        # Children of skipped or duplicate nodes attach to the nearest
-        # retained ancestor, never to the previous unrelated branch.
+        # Children of skipped nodes attach to their nearest retained ancestor.
         retained[index] = parent
-        anchor = (
-            spine_index.fragments.get((target.path, target.fragment))
-            if target.fragment else spine_index.files.get(target.path)
-        )
-        if anchor is None:
-            unresolved += 1
+        destination = first_destinations[index] if target.path is None else destinations[index]
+        if destination is None:
             continue
-        # A book/part heading and its first chapter may share a target.
-        # Keep references in separate branches; deduplicate siblings.
-        if (anchor, parent) in seen_anchors:
-            continue
-        spine_item = spine_index.items.get(target.path)
-        if spine_item is None:
-            unresolved += 1
-            continue
-        seen_anchors.add((anchor, parent))
+        anchor, spine_item = destination
+        # Authored aliases can have different labels or child branches. Keep
+        # each occurrence in preorder, even when its destination is shared.
         depth = entries[parent].depth + 1 if parent is not None else 0
         retained[index] = len(entries)
         entries.append(ResolvedTocEntry(anchor, target.label, spine_item.index, depth))
@@ -2692,8 +2729,9 @@ class MobiWriter:
             # Fixed-width guide digits keep the body offset independent of
             # the TOC's destination at the end of the book.
             body_start += len(_encode_mobi_text(self._build_guide_html(0)))
-            final_positions = [body_start + pos for pos in self._find_anchor_positions(positions)]
-            toc_entry_positions = tuple(final_positions)
+        final_positions = [body_start + pos for pos in self._find_anchor_positions(positions)]
+        toc_entry_positions = tuple(final_positions)
+        if len(self.epub.toc_entries) >= 2:
             if not body_bytes.rstrip().endswith(b"<mbp:pagebreak/>"):
                 toc_separator = b"<mbp:pagebreak/>"
             remaining = MAX_OUTPUT_HTML_BYTES - body_start - len(body_bytes) - len(toc_separator) - len(b"</body></html>")
@@ -2780,7 +2818,7 @@ class MobiWriter:
         return bytes(table)
 
     def _build_navigation_records(self, layout: TextLayout) -> list[bytes]:
-        if len(self.epub.toc_entries) < 2:
+        if not self.epub.toc_entries:
             return []
         if len(self.epub.toc_entries) > 0xFFFF:
             raise _NavigationSizeError("Logical TOC entry count exceeds single-record limit")
@@ -2788,6 +2826,13 @@ class MobiWriter:
         if len(depths) != len(self.epub.toc_entries):
             raise ValueError("TOC depth count does not match entry count")
         parents = _toc_parent_indices(depths)
+        entry_positions = list(layout.toc_entry_positions)
+        if any(parent is not None and entry_positions[index] < entry_positions[parent]
+               for index, parent in enumerate(parents)):
+            logger.warning("Logical TOC hierarchy flattened because a child precedes its parent in the text; "
+                           "authored destinations and the nested in-book TOC are retained")
+            depths = (0,) * len(depths)
+            parents = [None] * len(parents)
         child_ranges: dict[int, tuple[int, int]] = {}
         for index, parent in enumerate(parents):
             if parent is not None:
@@ -2807,7 +2852,6 @@ class MobiWriter:
 
         entry_offsets: list[int] = []
         entries_blob = bytearray()
-        entry_positions = list(layout.toc_entry_positions)
         # Auxiliary spine items can put TOC order out of physical text order.
         positions_in_text_order = sorted(set(entry_positions))
         end_by_position = {
@@ -3179,7 +3223,8 @@ class MobiWriter:
         try:
             nav_records = self._build_navigation_records(layout)
         except _NavigationSizeError as e:
-            logger.warning("Logical TOC omitted: %s; the inline TOC is retained", e)
+            retained = "the inline TOC is retained" if len(self.epub.toc_entries) >= 2 else "reading content is retained"
+            logger.warning("Logical TOC omitted: %s; %s", e, retained)
             nav_records = []
         text_bytes = layout.text_bytes
         image_records = list(self.epub.image_records)
