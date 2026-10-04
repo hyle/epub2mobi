@@ -825,27 +825,41 @@ def _reading_start_target(current_path: str, href: Optional[str], source: str,
 def _navigation_label(elem: ET.Element) -> str:
     """Lower a navigation label to text without loading its embedded media."""
     parts: list[str] = []
+    missing_alternative = False
 
-    def visit(node: ET.Element) -> None:
+    def visit(node: ET.Element) -> bool:
+        nonlocal missing_alternative
         tag = _strip_ns(node.tag)
         if tag in {"script", "style", "head"}:
-            return
-        if tag in {"img", "svg", "audio", "video", "object", "embed", "iframe", "canvas"}:
+            return False
+        embedded = tag in {"img", "svg", "audio", "video", "object", "embed", "iframe", "canvas"}
+        if embedded:
             alternative = node.get("alt", "")
             if not alternative.strip():
                 alternative = node.get("title", "")
             if not alternative.strip() and tag == "svg":
                 title = next((child for child in node if _strip_ns(child.tag) == "title"), None)
                 alternative = _visible_text(title) if title is not None else ""
-            parts.append(alternative)
-            return
+            if alternative.strip():
+                parts.append(alternative)
+                return True
+            if tag not in {"object", "canvas", "audio", "video"}:
+                missing_alternative = True
+                return False
         parts.append(node.text or "")
+        has_text = bool((node.text or "").strip())
         for child in node:
-            visit(child)
+            child_has_text = visit(child)
             parts.append(child.tail or "")
+            has_text |= child_has_text or bool((child.tail or "").strip())
+        if embedded and not has_text:
+            missing_alternative = True
+        return has_text
 
     visit(elem)
-    return " ".join("".join(parts).split()) or " ".join(elem.get("title", "").split())
+    label = " ".join("".join(parts).split())
+    title = " ".join(elem.get("title", "").split())
+    return title if title and missing_alternative else label or title
 
 
 def _extract_nav_targets(
@@ -2142,10 +2156,15 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
     return parts.text(), fallback_toc
 
 
-def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _SpineIndex) -> tuple[list[ResolvedTocEntry], bool]:
+def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _SpineIndex) -> tuple[list[ResolvedTocEntry], bool, int]:
     destinations: list[Optional[tuple[str, SpineItem]]] = []
     unresolved = 0
-    for target in targets:
+    coverage = 0
+    coverage_parents: dict[int, Optional[int]] = {}
+    covered: set[tuple[str, Optional[int]]] = set()
+    for index, target in enumerate(targets):
+        coverage_parent = coverage_parents.get(target.parent)
+        coverage_parents[index] = coverage_parent
         if target.path is None:
             destinations.append(None)
             continue
@@ -2155,6 +2174,14 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
         destination = (anchor, item) if anchor is not None and item is not None else None
         destinations.append(destination)
         unresolved += destination is None
+        # Recovery coverage retains the old resolver's sibling deduplication
+        # and parent promotion. Displayed aliases and groups do not inflate it.
+        if destination is not None:
+            key = (destination[0], coverage_parent)
+            if key not in covered:
+                covered.add(key)
+                coverage_parents[index] = coverage
+                coverage += 1
 
     # Give unlinked groups their first retained descendant's destination.
     # A reverse pass handles nested groups and skipped links in linear work.
@@ -2182,7 +2209,7 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
     if unresolved:
         logger.warning("%s TOC: skipped %d unresolved destination%s", source, unresolved,
                        "" if unresolved == 1 else "s")
-    return entries, bool(unresolved)
+    return entries, bool(unresolved), coverage
 
 
 def _resolve_reading_start(targets: list[ReadingStart], index: _SpineIndex) -> Optional[str]:
@@ -2222,12 +2249,12 @@ def _select_reading_start(nav_starts: list[ReadingStart], package: _EpubPackage,
 def _select_toc(nav_targets: list[TocTarget], ncx_targets: list[TocTarget],
                 fallback_toc: list[ResolvedTocEntry], index: _SpineIndex,
                 nav_invalid: bool = False) -> list[ResolvedTocEntry]:
-    nav_toc, nav_incomplete = _resolve_toc_targets(nav_targets, "EPUB3 nav", index)
-    ncx_toc, _ = _resolve_toc_targets(ncx_targets, "NCX", index)
+    nav_toc, nav_incomplete, nav_coverage = _resolve_toc_targets(nav_targets, "EPUB3 nav", index)
+    ncx_toc, _, ncx_coverage = _resolve_toc_targets(ncx_targets, "NCX", index)
     # Preserve authored TOCs even when some links are stale. A more complete
     # NCX can replace an incomplete nav; spine guesses are only a last resort.
     if nav_toc:
-        raw_toc = ncx_toc if (nav_incomplete or nav_invalid) and len(ncx_toc) > len(nav_toc) else nav_toc
+        raw_toc = ncx_toc if (nav_incomplete or nav_invalid) and ncx_coverage > nav_coverage else nav_toc
     else:
         raw_toc = ncx_toc or fallback_toc
 
