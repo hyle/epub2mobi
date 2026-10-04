@@ -2207,16 +2207,21 @@ def _finalize_toc(raw_toc: list[ResolvedTocEntry]) -> tuple[tuple[tuple[str, str
 
     toc_entries: list[tuple[str, str]] = []
     used_labels: set[tuple[Optional[int], str]] = set()
+    next_numbers: dict[tuple[Optional[int], str], int] = {}
     for entry, parent in zip(raw_toc, parents):
         # Repeated labels in different books/sections are already distinct
         # through their parents; only siblings need disambiguation.
-        if label_counts[(parent, entry.label)] > 1:
-            resolved = f"{entry.label} ({entry.spine_index})"
-        else:
-            resolved = entry.label
-
-        if (parent, resolved) in used_labels:
-            resolved = f"Chapter {entry.spine_index}"
+        key = (parent, entry.label)
+        resolved = entry.label
+        if label_counts[key] > 1:
+            number = next_numbers.get(key, 1)
+            resolved = f"{entry.label} ({number})"
+            # Reserve authored labels, including those occurring later. Each
+            # sibling group advances its counter rather than restarting it.
+            while (parent, resolved) in label_counts or (parent, resolved) in used_labels:
+                number += 1
+                resolved = f"{entry.label} ({number})"
+            next_numbers[key] = number + 1
         used_labels.add((parent, resolved))
         toc_entries.append((entry.anchor, resolved))
 
@@ -3287,7 +3292,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--report-omissions",
         action="store_true",
-        help="List media resources that were omitted from the MOBI output",
+        help="List resources that were omitted from the MOBI output",
     )
     return parser
 
@@ -3295,11 +3300,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 def _log_media_omissions(omissions: tuple[MediaOmission, ...], detailed: bool) -> None:
     if not omissions:
         if detailed:
-            logger.info("No omissions detected by the media scan; CSS background assets were not inspected.")
+            logger.info("No omissions detected by the resource scan; CSS background assets were not inspected.")
         return
 
     logger.warning(
-        "%d media omission%s detected%s",
+        "%d resource omission%s detected%s",
         len(omissions),
         "" if len(omissions) == 1 else "s",
         ":" if detailed else " (use --report-omissions for details).",

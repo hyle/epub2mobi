@@ -1,6 +1,6 @@
 # epub2mobi.py
 
-`epub2mobi.py` converts EPUB books to MOBI6 for your Kindle using a single Python script, with no external dependencies and no internet connection required.
+`epub2mobi.py` converts EPUB books to legacy MOBI6 for Kindle devices. It is a single Python script with no external dependencies and no internet connection required.
 
 Download the script, run it, and bring your books to your Kindle.
 
@@ -34,7 +34,7 @@ python3 epub2mobi.py my_book.epub --deploy
 
 Automatic deployment copies only when exactly one Kindle matches. Multiple matches produce an error before copying; the local MOBI remains available for manual transfer. Duplicate paths and symlink aliases count as one match.
 
-List omitted media and the reasons:
+List omitted resources and the reasons:
 
 ```bash
 python3 epub2mobi.py my_book.epub --report-omissions
@@ -58,11 +58,13 @@ For Kindles that support MOBI files, this tool provides a simple, offline EPUB â
 
 Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
-Missing, empty, or unsupported media are skipped and reported. Raster images with mismatched signatures are also omitted. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows an omission count; `--report-omissions` adds resource paths, source documents, and reasons. CSS background assets are not inspected.
+Missing, empty, or unsupported media are skipped and reported. Raster images with mismatched signatures are also omitted. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows a resource omission count; `--report-omissions` adds resource paths, source documents, and reasons, including remote manifest resources such as stylesheets and documents. CSS background assets are not inspected.
 
 ## Navigation and metadata
 
 EPUB3 navigation is preferred. A more complete NCX can replace an incomplete nav; a spine-based TOC is generated only when no authored destinations resolve. Unresolved destinations produce warnings while valid entries and their hierarchy remain. Children of skipped entries attach to the nearest retained ancestor.
+
+Duplicate sibling TOC labels receive numeric suffixes in TOC order, skipping suffixes that would collide with authored sibling labels. Identical labels under different parents are kept independently. Destinations and hierarchy are unchanged.
 
 Books with multiple TOC entries also get a linked TOC at the end, with a guide link for readers that use it for navigation. If the logical MOBI TOC exceeds its supported record size, it is omitted with a warning and the in-book TOC remains.
 
