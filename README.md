@@ -78,7 +78,7 @@ The first nonempty Dublin Core title is used. Creator order is preserved, with n
 
 The first nonempty language sets the MOBI locale. Recognized regions are retained; unmapped variants fall back to the primary language with a warning. Missing or unknown languages use a neutral locale, with a warning for unknown values.
 
-The MOBI header declares Windows-1252. Body characters outside that encoding use numeric character references; title and author metadata replace unrepresentable characters with `?` and produce a warning. Generated HTML omits a redundant charset declaration so readers can reserialize decoded text without retaining a conflicting encoding hint.
+The MOBI header declares Windows-1252. Body characters outside that encoding use numeric character references; title and author metadata replace unrepresentable characters with `?` and produce a warning. Logical TOC labels are stored separately as UTF-8, declared as codepage `65001` in the navigation index. Generated HTML omits a redundant charset declaration so readers can reserialize decoded text without retaining a conflicting encoding hint.
 
 ## Supported formatting
 

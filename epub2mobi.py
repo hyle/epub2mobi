@@ -107,6 +107,7 @@ EXTH_START_READING = 116
 DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
 OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
 EPUB_NAMESPACE = "{http://www.idpf.org/2007/ops}"
+CONTAINER_NAMESPACE = "{urn:oasis:names:tc:opendocument:xmlns:container}"
 
 # Recognized MARC relators, including discontinued codes found in older EPUBs.
 # Source: https://www.loc.gov/marc/relators/relacode.html (checked 2026-10-01).
@@ -593,12 +594,15 @@ def _find_opf(resources: _ResourceReader) -> tuple[str, str]:
         raise ConversionError("Invalid EPUB container: missing META-INF/container.xml") from e
 
     opf_path = None
-    for elem in root.iter():
-        if elem.tag.endswith("rootfile"):
+    # Prefer OCF declarations; tolerate missing namespaces in imperfect EPUBs.
+    for tag in (CONTAINER_NAMESPACE + "rootfile", "rootfile"):
+        for elem in root.iter(tag):
             candidate = elem.attrib.get("full-path")
             if candidate:
                 opf_path = candidate
                 break
+        if opf_path:
+            break
     if not opf_path:
         raise ConversionError("Invalid EPUB container: no rootfile in META-INF/container.xml")
 
@@ -677,8 +681,12 @@ def _extract_body_snippet(root: ET.Element, book_title: str, max_words: int = 10
         return None
 
     normalized_book_title = " ".join(book_title.split()).strip()
-    if normalized_book_title and text.lower().startswith(normalized_book_title.lower()):
-        text = text[len(normalized_book_title) :].lstrip(" :;,-.")
+    title_end = len(normalized_book_title)
+    following = text[title_end:title_end + 1]
+    if (normalized_book_title
+            and text[:title_end].casefold() == normalized_book_title.casefold()
+            and (not following or following.isspace() or following in ":;,-.—–")):
+        text = text[title_end:].lstrip(" :;,-.—–")
         text = " ".join(text.split())
         if not text:
             return None
@@ -907,18 +915,18 @@ def _extract_nav_targets(
         stack.extend((child, landmarks) for child in reversed(list(elem)))
 
     toc_nav = None
+    fallback_nav = None
     for elem in _visible_elements(nav_root):
         if elem.tag != "nav":
             continue
-        nav_type = ""
-        for key, value in elem.attrib.items():
-            local_key = _strip_ns(key).lower()
-            if local_key == "type" and value:
-                nav_type = value
-                break
+        nav_type = elem.get(EPUB_NAMESPACE + "type", "")
         if "toc" in nav_type.split():
             toc_nav = elem
             break
+        if not nav_type.strip() and fallback_nav is None and "toc" in elem.get("type", "").split():
+            fallback_nav = elem
+    if toc_nav is None:
+        toc_nav = fallback_nav
     if toc_nav is None:
         return [], False, reading_starts
 
