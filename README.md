@@ -92,11 +92,11 @@ Styles come from XHTML `<style>` blocks, local UTF-8 stylesheets (an optional BO
 | `text-indent` | `0`, nonnegative lengths in `em` or `pt` |
 | `display` | `none` suppresses reading content; recognized ordinary display values reset it without emulating layout |
 
-Precedence is **inline style > class rule > element rule**, separately for each property. Later declarations win ties in document order. Text properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
+For supported properties, `!important` declarations take precedence over normal declarations. Within the same importance level, precedence is **inline style > class rule > element rule**, separately for each property; later declarations win ties in document order. Text properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
 
 An element with a `hidden` attribute (regardless of its value), supported `display:none`, or a hidden ancestor is excluded from reading content. Hidden inline images are not loaded; hidden fragments cannot supply TOC or reading-start destinations. Text outside a hidden subtree is retained. `display` does not inherit unless requested with `inherit`; `initial` and `unset` reset it. A child cannot undo an ancestor's hiddenness. Hidden navigation metadata remains available, and a declared cover is handled independently.
 
-Common class/ID hints and valid inline auto margins provide alignment when no supported CSS alignment applies. Compound, descendant, ID, and pseudo selectors, other properties, `!important`, and at-rule blocks such as `@import` and `@media` are skipped. Alternate or disabled stylesheets, and those whose `media` is neither empty nor `all`, are skipped. Missing, remote, or non-UTF-8 stylesheets are reported.
+Recognized `align` attributes (`left`, `right`, `center`, `justify`) provide local alignment hints that authored CSS can override. Common class/ID hints and valid inline auto margins provide alignment when no computed alignment applies. Compound, descendant, ID, and pseudo selectors, other properties, and at-rule blocks such as `@import` and `@media` are skipped. Alternate or disabled stylesheets, and those whose `media` is neither empty nor `all`, are skipped. Missing, remote, or non-UTF-8 stylesheets are reported.
 
 `float` is inspected only to repair detached text drop caps. A left-floating initial can join the immediately following paragraph when its continuation starts with a lowercase or uncased letter and the structure makes the join unambiguous. Formatting, accents, and link targets are preserved; the initial becomes ordinary inline text. Explicit spaces at the join, including nonbreaking spaces, prevent joining; XML newline indentation may be removed when joining is safe. Image initials and CSS-generated letters are not reconstructed, and general float layout is unsupported.
 
@@ -118,6 +118,8 @@ Conversion and USB deployment write to a temporary file beside the destination, 
 
 Expected input, conversion, archive, and file errors return a nonzero CLI status with a concise message. Unexpected programming errors retain their traceback. If deployment fails, the completed local MOBI remains available; if no Kindle is detected, conversion succeeds with a warning. Library callers can catch `ConversionError` (a `ValueError` subclass); filesystem and ZIP validation errors retain their standard types.
 
+If no reading text or supported inline images survive conversion, a warning is emitted without blocking output. Image alternatives count as reading text; generated anchors, list numbers, TOC labels, and cover records alone do not.
+
 ## Resource limits
 
 Size and processing limits keep malformed or unusually large books from consuming excessive resources. Exceeding a processing budget stops conversion, including during optional TOC processing. These limits do not impose a wall-clock timeout.
@@ -128,6 +130,7 @@ Size and processing limits keep malformed or unusually large books from consumin
 | Resource | Limit |
 | --- | --- |
 | Archive file | 512 MiB |
+| ZIP central directory | 16 MiB |
 | ZIP entries | 10,000, including unused and duplicate entries |
 | Total declared uncompressed ZIP data | 1 GiB |
 | Unique physical members read | 256 MiB combined |
@@ -144,7 +147,7 @@ Size and processing limits keep malformed or unusually large books from consumin
 | Linked stylesheet cache | 50,000 supported selector entries |
 | Generated HTML | 64 MiB in MOBI encoding, including character references, link positions, and the footer TOC |
 
-Only stored and DEFLATE ZIP entries are accepted. Archive size is checked before opening the ZIP directory; entry count, compression methods, and total declared content are checked after directory loading and before member reads.
+Only stored and DEFLATE ZIP entries are accepted. Archive size, central-directory bytes, and actual entry count are checked before `ZipFile` loads directory metadata; entry counting does not trust the totals declared in ZIP end records. Compression methods and total declared content are checked before member reads. ZIP64 end records, archive comments, and ZIP prefixes remain supported.
 
 Unique-member accounting survives cache eviction. Read work charges failed reads and rereads; cache hits are free. Spine and CSS processing count repeated references even when cached. Each resource use still enforces its size limit.
 
