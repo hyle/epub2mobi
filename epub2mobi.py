@@ -76,6 +76,7 @@ MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10000
+MAX_ZIP_DIRECTORY_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_DECOMPRESSION_WORK_BYTES = 512 * 1024 * 1024
 MAX_RESOURCE_CACHE_BYTES = 8 * 1024 * 1024
@@ -1061,6 +1062,65 @@ def _validate_archive_member_name(info: zipfile.ZipInfo) -> list[str]:
     return parts
 
 
+def _preflight_zip_directory(source: BinaryIO, archive_size: int) -> None:
+    """Bound central-directory allocation before ZipFile builds its metadata.
+
+    Inspect record lengths only; zipfile still owns decoding and extraction.
+    Locate the directory relative to the end records, allowing ZIP prefixes
+    and the ordinary ZIP64 end records supported by zipfile.
+    """
+    original_position = source.tell()
+    try:
+        tail_start = max(0, archive_size - 65536 - 22)
+        source.seek(tail_start)
+        tail = source.read(archive_size - tail_start)
+        marker = tail.rfind(b"PK\x05\x06")
+        if marker < 0 or marker + 22 > len(tail):
+            raise zipfile.BadZipFile("Missing ZIP end record")
+        end_position = tail_start + marker
+        directory_size = struct.unpack_from("<I", tail, marker + 12)[0]
+        directory_end = end_position
+        if end_position >= 20:
+            source.seek(end_position - 20)
+            locator = source.read(20)
+            if locator[:4] == b"PK\x06\x07":
+                _, disk, _, disks = struct.unpack("<4sIQI", locator)
+                if disk != 0 or disks > 1:
+                    raise zipfile.BadZipFile("ZIP archives spanning multiple disks are unsupported")
+                if end_position >= 76:
+                    source.seek(end_position - 76)
+                    end64 = source.read(56)
+                    if end64[:4] == b"PK\x06\x06":
+                        directory_size = struct.unpack_from("<Q", end64, 40)[0]
+                        directory_end -= 76
+        if directory_size > MAX_ZIP_DIRECTORY_BYTES:
+            raise ConversionError(f"EPUB ZIP directory too large: {directory_size} bytes > {MAX_ZIP_DIRECTORY_BYTES} bytes")
+        directory_start = directory_end - directory_size
+        if directory_start < 0:
+            raise zipfile.BadZipFile("ZIP directory extends before the archive")
+        source.seek(directory_start)
+        remaining = directory_size
+        count = 0
+        while remaining:
+            if remaining < 46:
+                raise zipfile.BadZipFile("Truncated ZIP directory entry")
+            header = source.read(46)
+            if len(header) != 46 or header[:4] != b"PK\x01\x02":
+                raise zipfile.BadZipFile("Invalid ZIP directory entry")
+            variable_size = sum(struct.unpack_from("<HHH", header, 28))
+            if 46 + variable_size > remaining:
+                raise zipfile.BadZipFile("Truncated ZIP directory entry")
+            count += 1
+            if count > MAX_ARCHIVE_ENTRIES:
+                raise ConversionError(f"EPUB archive has too many entries: exceeds {MAX_ARCHIVE_ENTRIES}")
+            # Counts in end records can lie. Count actual records without
+            # allocating their names, extra fields, or comments.
+            source.seek(variable_size, os.SEEK_CUR)
+            remaining -= 46 + variable_size
+    finally:
+        source.seek(original_position)
+
+
 def _validate_archive(archive: zipfile.ZipFile) -> None:
     entries = archive.infolist()
     if len(entries) > MAX_ARCHIVE_ENTRIES:
@@ -1258,16 +1318,20 @@ def _css_declaration_values(text: str):
         yield parts[0][0].strip().lower(), parts[1][0].strip()
 
 
-def _css_declarations(text: str) -> dict[str, str]:
-    declarations: dict[str, str] = {}
+def _css_declarations(text: str) -> dict[str, tuple[bool, str]]:
+    declarations: dict[str, tuple[bool, str]] = {}
     for name, raw_value in _css_declaration_values(text):
+        annotation = re.search(r"!\s*important\s*$", raw_value, re.IGNORECASE)
+        important = annotation is not None
+        if annotation is not None:
+            raw_value = raw_value[:annotation.start()]
         value = _css_value(name, raw_value)
-        if value is not None:
-            declarations[name] = value
+        if value is not None and (name not in declarations or important >= declarations[name][0]):
+            declarations[name] = (important, value)
     return declarations
 
 
-def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
+def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
     """Read flat rules, skipping entire at-rule and malformed nested blocks."""
     rules = []
     depth = 0
@@ -1306,11 +1370,14 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, str]]]:
 class _CssStyles:
     """Resolve text styles, rendered hiddenness, and the drop-cap float hint."""
 
-    def __init__(self, document: ET.Element, rules: list[tuple[str, dict[str, str]]]):
-        by_selector: dict[str, dict[str, tuple[int, str]]] = {}
+    def __init__(self, document: ET.Element, rules: list[tuple[str, dict[str, tuple[bool, str]]]]):
+        by_selector: dict[str, dict[str, tuple[bool, int, str]]] = {}
         for order, (selector, declarations) in enumerate(rules):
             target = by_selector.setdefault(selector, {})
-            target.update((name, (order, value)) for name, value in declarations.items())
+            for name, (important, value) in declarations.items():
+                candidate = (important, order, value)
+                if name not in target or candidate[:2] > target[name][:2]:
+                    target[name] = candidate
         self.styles: dict[ET.Element, dict[str, str]] = {}
         self.floats: dict[ET.Element, str] = {}
         self.hidden: set[ET.Element] = set()
@@ -1318,15 +1385,22 @@ class _CssStyles:
 
         def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
                     parent_hidden: bool = False, parent_display: str = "initial") -> None:
-            chosen = {name: (0, order, value)
-                      for name, (order, value) in by_selector.get(elem.tag, {}).items()}
+            chosen = {name: (important, 0, order, value)
+                      for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
             for cls in set(elem.get("class", "").split()):
-                for name, (order, value) in by_selector.get("." + cls, {}).items():
-                    candidate = (1, order, value)
-                    if name not in chosen or candidate[:2] > chosen[name][:2]:
+                for name, (important, order, value) in by_selector.get("." + cls, {}).items():
+                    candidate = (important, 1, order, value)
+                    if name not in chosen or candidate[:3] > chosen[name][:3]:
                         chosen[name] = candidate
-            local = {name: value for name, (_, _, value) in chosen.items()}
-            local.update(_css_declarations(elem.get("style", "")))
+            for name, (important, value) in _css_declarations(elem.get("style", "")).items():
+                candidate = (important, 2, 0, value)
+                if name not in chosen or candidate[:3] > chosen[name][:3]:
+                    chosen[name] = candidate
+            local = {}
+            alignment = elem.get("align", "").strip().lower()
+            if (elem.tag in _HTML_BLOCKS or elem.tag == "body") and alignment in {"left", "right", "center", "justify"}:
+                local["text-align"] = alignment
+            local.update((name, value) for name, (_, _, _, value) in chosen.items())
             display = local.pop("display", "initial")
             if display == "inherit":
                 display = parent_display
@@ -2018,14 +2092,14 @@ class _StylesheetLoader:
 
     def __init__(self, resources: _ResourceReader):
         self.resources = resources
-        self.cache: dict[str, tuple[int, list[tuple[str, dict[str, str]]]]] = {}
+        self.cache: dict[str, tuple[int, list[tuple[str, dict[str, tuple[bool, str]]]]]] = {}
         self.cached_selectors = 0
         self.processed_selectors = 0
         self.processed_bytes = 0
         self.errors: dict[str, str] = {}
 
     def for_document(self, item: SpineItem) -> _CssStyles:
-        rules: list[tuple[str, dict[str, str]]] = []
+        rules: list[tuple[str, dict[str, tuple[bool, str]]]] = []
         css_bytes = 0
 
         def reserve(size: int) -> None:
@@ -2037,7 +2111,7 @@ class _StylesheetLoader:
                 raise _ResourceLimitError("EPUB CSS processing byte limit exceeded")
             self.processed_bytes += size
 
-        def add_rules(additional: list[tuple[str, dict[str, str]]]) -> None:
+        def add_rules(additional: list[tuple[str, dict[str, tuple[bool, str]]]]) -> None:
             if len(rules) + len(additional) > MAX_CSS_SELECTORS:
                 raise _ResourceLimitError(f"Too many document CSS selectors: {item.full_path}")
             if self.processed_selectors + len(additional) > MAX_CSS_PROCESSING_SELECTORS:
@@ -2128,6 +2202,7 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
                   ncx_targets: list[TocTarget]) -> tuple[str, list[ResolvedTocEntry]]:
     parts = _HtmlBuffer()
     fallback_toc: list[ResolvedTocEntry] = []
+    has_reading_content = False
     for item in spine_items:
         parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
         sanitizer = MinimalHtmlSanitizer(
@@ -2143,6 +2218,7 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
             output_limit=parts.limit - parts.size,
         )
         clean = sanitizer.sanitize(item.body)
+        has_reading_content |= sanitizer.has_reading_content
         # Derive fallback labels from the normalized reading text too.
         ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
         guessed_title = _extract_title(item.document)
@@ -2161,6 +2237,8 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
             parts.append(clean)
             parts.append("<mbp:pagebreak/>")
 
+    if not has_reading_content:
+        logger.warning("No reading content retained: output contains no visible text or embedded reading images")
     return parts.text(), fallback_toc
 
 
@@ -2311,6 +2389,7 @@ def parse_epub(filepath: Union[str, Path]) -> EpubData:
         archive_size = os.fstat(source.fileno()).st_size
         if archive_size > MAX_ARCHIVE_BYTES:
             raise ConversionError(f"EPUB archive too large: {archive_size} bytes > {MAX_ARCHIVE_BYTES} bytes")
+        _preflight_zip_directory(source, archive_size)
         try:
             archive = zipfile.ZipFile(source, "r")
         except (NotImplementedError, UnicodeDecodeError) as e:
@@ -2380,6 +2459,7 @@ class MinimalHtmlSanitizer:
         self.styles = styles
         self.emitted_anchors: set[str] = set()
         self.list_layout: dict[ET.Element, tuple[Optional[str], str]] = {}
+        self.has_reading_content = False
 
     @staticmethod
     def _list_label(number: int, kind: str) -> str:
@@ -2523,6 +2603,7 @@ class MinimalHtmlSanitizer:
 
     def sanitize(self, body: ET.Element) -> str:
         self.fed = _HtmlBuffer(self.output_limit)
+        self.has_reading_content = False
         # The spine's file marker is emitted before this sanitizer runs.
         self.emitted_anchors = {self.file_anchor} if self.file_anchor else set()
         if self.styles is None or body not in self.styles.styles:
@@ -2534,7 +2615,9 @@ class MinimalHtmlSanitizer:
         self._emit(body)
         return self.fed.text()
 
-    def _emit_text(self, text: str, style: dict[str, str]) -> None:
+    def _emit_text(self, text: str, style: dict[str, str], *, reading_content: bool = True) -> None:
+        if reading_content and text.strip():
+            self.has_reading_content = True
         text = htmlmod.escape(text, quote=False)
         if self.styles.font_runs:
             if style.get("font-style") == "italic":
@@ -2584,6 +2667,7 @@ class MinimalHtmlSanitizer:
             recindex = self.image_path_to_recindex.get(resolved[0]) if resolved else None
             if recindex is not None:
                 self.fed.append(f'<img recindex="{recindex}"/>')
+                self.has_reading_content = True
             elif attrs.get("alt", "").strip():
                 self._emit_text(attrs["alt"], style)
             return
@@ -2610,7 +2694,7 @@ class MinimalHtmlSanitizer:
         elif tag in _HTML_FLATTENED_BLOCKS:
             self._ensure_block_sep()
         if list_label:
-            self._emit_text(list_label, style)
+            self._emit_text(list_label, style, reading_content=False)
         if elem.text:
             self._emit_text(elem.text, style)
         for child in elem:
