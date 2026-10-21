@@ -64,7 +64,7 @@ Missing, empty, or unsupported media are skipped and reported. Raster images wit
 
 EPUB3 navigation is preferred. A more complete NCX can replace an incomplete nav; this recovery comparison ignores grouping headings and counts duplicate sibling destinations once, using the nearest retained ancestor for children of skipped or duplicate entries. Displayed aliases and groups do not inflate recovery coverage. A spine-based TOC is generated only when no authored destinations resolve. Unresolved destinations produce warnings while valid entries and their hierarchy remain. Children of skipped entries attach to the nearest retained ancestor.
 
-Navigation labels retain text alternatives from embedded content: nonblank `alt` takes precedence over `title`, SVG can supply its own `<title>`, and `object`, `canvas`, `audio`, and `video` can supply fallback child text when no usable alternative exists. The enclosing link or grouping span's `title` is used when no label text remains, or replaces a partial label when embedded content has no usable alternative or fallback. Navigation images are not loaded just to extract labels. Unlinked grouping headings use their first retained descendant's destination; groups without a retained destination are skipped. Authored aliases retain their labels and child branches even when they share a destination.
+Navigation labels retain text alternatives from embedded content: nonblank `alt` takes precedence over `title`, SVG can supply its own `<title>`, and `object`, `canvas`, `audio`, and `video` can supply fallback child text when no usable alternative exists. The enclosing link or grouping span's `title` is used when no label text remains, or replaces a partial label when embedded content has no usable alternative or fallback. Explicit `<br>` breaks become spaces, preserving word boundaries in both the logical and in-book TOCs. Navigation images are not loaded just to extract labels. Unlinked grouping headings use their first retained descendant's destination; groups without a retained destination are skipped. Authored aliases retain their labels and child branches even when they share a destination.
 
 Duplicate sibling TOC labels receive numeric suffixes in TOC order, skipping suffixes that would collide with authored sibling labels. Identical labels under different parents are kept independently. Destinations and hierarchy are unchanged.
 
@@ -154,6 +154,8 @@ Unique-member accounting survives cache eviction. Read work charges failed reads
 XML structure is checked before tree construction, including locally resolved XHTML attributes. The combined length of namespace-expanded element and attribute names is bounded by the document's XML byte limit. HTML is checked during emission and before compression.
 
 The byte cache holds at most 8 MiB and 128 entries. A separate parsed XML/XHTML cache holds at most 8 MiB of source data, 65,536 elements, and 128 entries. Larger documents within the conversion limits are processed without caching. Cached spine trees are copied before editing.
+
+Fallback aliases share each document's fragment map, avoiding a separate set of fragment entries for every alias.
 
 </details>
 
