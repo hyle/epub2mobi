@@ -3050,15 +3050,25 @@ class MobiWriter:
         max_len = min(10, len(data) - pos)
         if max_len < 3:
             return 0, 0
-
-        for length in range(max_len, 2, -1):
-            match = data[pos : pos + length]
-            hit = data.rfind(match, window_start, pos)
-            if hit != -1:
-                distance = pos - hit
-                if 1 <= distance <= 2047:
-                    return distance, length
-        return 0, 0
+        # Preserve the single-lookup fast path for long repetitions.
+        hit = data.rfind(data[pos:pos + max_len], window_start, pos)
+        if hit != -1:
+            return pos - hit, max_len
+        # No length-3 match implies no longer match.
+        hit = data.rfind(data[pos:pos + 3], window_start, pos)
+        if hit == -1:
+            return 0, 0
+        best_hit, best_len = hit, 3
+        low, high = 4, max_len - 1
+        while low <= high:
+            mid = (low + high) // 2
+            hit = data.rfind(data[pos:pos + mid], window_start, pos)
+            if hit == -1:
+                high = mid - 1
+            else:
+                best_hit, best_len = hit, mid
+                low = mid + 1
+        return pos - best_hit, best_len
 
     @staticmethod
     def _compress_palmdoc(data: bytes) -> bytes:
