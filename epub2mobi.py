@@ -232,7 +232,8 @@ _RIGHT_HINTS: frozenset[str] = frozenset({"right", "author", "attribution", "cre
 def _tokenize_hints(*values: str) -> set[str]:
     tokens: set[str] = set()
     for value in values:
-        tokens.update(token for token in re.split(r"[^a-z0-9_-]+", value.lower()) if token)
+        if value:
+            tokens.update(token for token in re.split(r"[^a-z0-9_-]+", value.lower()) if token)
     return tokens
 
 
@@ -392,7 +393,10 @@ class _HtmlBuffer:
         self.size = 0
 
     def append(self, text: str) -> None:
-        size = len(_encode_mobi_text(text))
+        # ASCII is represented by one byte per character in CP1252.
+        # Keep the exact encoded-length check for all other text, where an
+        # unrepresentable codepoint can expand to a numeric character entity.
+        size = len(text) if text.isascii() else len(_encode_mobi_text(text))
         if self.size + size > self.limit:
             raise _ResourceLimitError("Generated HTML too large")
         self.size += size
@@ -1392,10 +1396,12 @@ class _CssStyles:
                     candidate = (important, 1, order, value)
                     if name not in chosen or candidate[:3] > chosen[name][:3]:
                         chosen[name] = candidate
-            for name, (important, value) in _css_declarations(elem.get("style", "")).items():
-                candidate = (important, 2, 0, value)
-                if name not in chosen or candidate[:3] > chosen[name][:3]:
-                    chosen[name] = candidate
+            inline_style = elem.get("style", "")
+            if inline_style:
+                for name, (important, value) in _css_declarations(inline_style).items():
+                    candidate = (important, 2, 0, value)
+                    if name not in chosen or candidate[:3] > chosen[name][:3]:
+                        chosen[name] = candidate
             local = {}
             alignment = elem.get("align", "").strip().lower()
             if (elem.tag in _HTML_BLOCKS or elem.tag == "body") and alignment in {"left", "right", "center", "justify"}:
@@ -1413,7 +1419,7 @@ class _CssStyles:
             if floating == "inherit":
                 floating = parent_float
             self.floats[elem] = floating
-            self.font_runs |= not hidden and bool(local.keys() & {"font-style", "font-weight"})
+            self.font_runs |= not hidden and ("font-style" in local or "font-weight" in local)
             style = dict(parent)
             # Semantic markup provides local defaults, which authored CSS can reset.
             heading_hint = _has_heading_hint(elem)
@@ -2643,8 +2649,11 @@ class MinimalHtmlSanitizer:
             )
         table_tag = tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
         output_tag = tag if tag in _HTML_ALLOWED and not (flatten_table and table_tag) else None
-        hints = _tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
-        if output_tag in {"p", "div"} and _has_heading_hint(elem):
+        # Hint tokens are only consumed for block alignment and p/div headings.
+        # Avoid tokenizing non-block inline content and avoid a second parse.
+        hints = (_tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
+                 if output_tag in _HTML_BLOCKS else set())
+        if output_tag in {"p", "div"} and hints & _HEADING_HINTS:
             output_tag = "h2"
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
         if self.styles.font_runs and output_tag in {"b", "i"}:
@@ -3078,8 +3087,9 @@ class MobiWriter:
         out = bytearray()
         i = 0
         n = len(data)
+        best_backref = MobiWriter._best_backref
         while i < n:
-            distance, length = MobiWriter._best_backref(data, i)
+            distance, length = best_backref(data, i)
             if length >= 3:
                 code = (distance << 3) | (length - 3)
                 out.append(0x80 | ((code >> 8) & 0x3F))
@@ -3104,7 +3114,7 @@ class MobiWriter:
                 if b == 0x00 or 0x09 <= b <= 0x7F:
                     break
                 # First byte already proved non-backref by the outer loop check.
-                if run and MobiWriter._best_backref(data, i)[1] >= 3:
+                if run and best_backref(data, i)[1] >= 3:
                     break
                 run.append(b)
                 i += 1
