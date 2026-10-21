@@ -22,6 +22,7 @@ import unicodedata
 import zipfile
 import zlib
 from collections import OrderedDict
+from collections.abc import Mapping
 from copy import deepcopy
 # ElementTree is used to keep the converter dependency-free.
 # Untrusted XML is size-limited and pre-screened for unsafe declarations in
@@ -316,10 +317,29 @@ class SpineItem:
     styles: Optional[_CssStyles] = None
 
 
+class _SpineFragments(Mapping[tuple[str, str], str]):
+    """Resolve aliases through shared document maps without copying fragments."""
+
+    def __init__(self, items: dict[str, SpineItem]):
+        self._items = items
+
+    def __getitem__(self, key: tuple[str, str]) -> str:
+        path, fragment = key
+        return self._items[path].fragment_anchors[fragment]
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        for path, item in self._items.items():
+            for fragment in item.fragment_anchors:
+                yield path, fragment
+
+    def __len__(self) -> int:
+        return sum(len(item.fragment_anchors) for item in self._items.values())
+
+
 @dataclass(frozen=True)
 class _SpineIndex:
     files: dict[str, str]
-    fragments: dict[tuple[str, str], str]
+    fragments: Mapping[tuple[str, str], str]
     items: dict[str, SpineItem]
 
 
@@ -844,6 +864,9 @@ def _navigation_label(elem: ET.Element) -> str:
         nonlocal missing_alternative
         tag = _strip_ns(node.tag)
         if tag in {"script", "style", "head"}:
+            return False
+        if tag == "br":
+            parts.append(" ")
             return False
         embedded = tag in {"img", "svg", "audio", "video", "object", "embed", "iframe", "canvas"}
         if embedded:
@@ -1562,7 +1585,7 @@ def _normalize_drop_caps(body: ET.Element, styles: _CssStyles) -> None:
             return
         children = list(parent)
         for initial, paragraph in zip(children, children[1:]):
-            if (paragraph.tag != "p" or (initial.tail or "").strip(xml_whitespace)
+            if (paragraph.tag != "p" or initial_layout_text(initial.tail or "") != ""
                     or styles.floats.get(paragraph, "none") != "none"
                     or _has_heading_hint(paragraph)
                     or not is_initial(initial)):
@@ -1990,7 +2013,6 @@ def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list
 
 def _index_spine(spine_items: list[SpineItem]) -> _SpineIndex:
     file_anchor_map: dict[str, str] = {}
-    fragment_anchor_map: dict[tuple[str, str], str] = {}
     spine_by_path: dict[str, SpineItem] = {}
     # References from other documents to a shared fallback choose its first
     # occurrence. Each occurrence retains its own markers and self-links.
@@ -1998,10 +2020,8 @@ def _index_spine(spine_items: list[SpineItem]) -> _SpineIndex:
         for path in item.aliases:
             spine_by_path.setdefault(path, item)
             file_anchor_map.setdefault(path, item.anchor)
-            for fragment, anchor in item.fragment_anchors.items():
-                fragment_anchor_map.setdefault((path, fragment), anchor)
 
-    return _SpineIndex(file_anchor_map, fragment_anchor_map, spine_by_path)
+    return _SpineIndex(file_anchor_map, _SpineFragments(spine_by_path), spine_by_path)
 
 
 class _ImageLoader:
@@ -2441,7 +2461,7 @@ class MinimalHtmlSanitizer:
         self,
         current_path: str,
         file_anchor_map: dict[str, str],
-        fragment_anchor_map: dict[tuple[str, str], str],
+        fragment_anchor_map: Mapping[tuple[str, str], str],
         image_path_to_recindex: dict[str, int],
         base_url: Optional[str] = None,
         current_aliases: Optional[tuple[str, ...]] = None,
