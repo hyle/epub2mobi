@@ -111,6 +111,7 @@ EXTH_START_READING = 116
 
 DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
 OPF_NAMESPACE = "{http://www.idpf.org/2007/opf}"
+NCX_NAMESPACE = "{http://www.daisy.org/z3986/2005/ncx/}"
 EPUB_NAMESPACE = "{http://www.idpf.org/2007/ops}"
 CONTAINER_NAMESPACE = "{urn:oasis:names:tc:opendocument:xmlns:container}"
 
@@ -254,6 +255,12 @@ def _has_heading_hint(elem: ET.Element) -> bool:
 def _strip_ns(tag: str) -> str:
     """Remove XML namespace prefix from tag names."""
     return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _find_xml_child(parent: ET.Element, name: str, namespace: str) -> Optional[ET.Element]:
+    """Prefer the vocabulary's namespace, then an unnamespaced compatibility child."""
+    child = parent.find(namespace + name)
+    return child if child is not None else parent.find(name)
 
 
 @dataclass(frozen=True)
@@ -1046,21 +1053,26 @@ def _extract_ncx_toc_targets(
     while stack:
         elem, parent = stack.pop()
         child_parent = parent
-        if _strip_ns(elem.tag) == "navPoint":
+        if elem.tag.startswith("{") and not elem.tag.startswith(NCX_NAMESPACE):
+            continue
+        if elem.tag in {NCX_NAMESPACE + "navPoint", "navPoint"}:
             points += 1
             if points > MAX_BOOK_ENTRIES:
                 raise _ResourceLimitError(f"Too many navigation entries: {ncx_path}")
             # Only this navPoint's own label/content may describe it. Searching
             # all descendants can accidentally borrow a nested child's values.
-            nav_label = next((child for child in elem if _strip_ns(child.tag) == "navLabel"), None)
+            nav_label = _find_xml_child(elem, "navLabel", NCX_NAMESPACE)
             label = None
             if nav_label is not None:
-                for child in nav_label:
-                    candidate = " ".join((child.text or "").split())
-                    if _strip_ns(child.tag) == "text" and candidate:
-                        label = candidate
+                for tag in (NCX_NAMESPACE + "text", "text"):
+                    for child in nav_label.iterfind(tag):
+                        candidate = " ".join((child.text or "").split())
+                        if candidate:
+                            label = candidate
+                            break
+                    if label:
                         break
-            content = next((child for child in elem if _strip_ns(child.tag) == "content"), None)
+            content = _find_xml_child(elem, "content", NCX_NAMESPACE)
             src = content.get("src") if content is not None else None
             try:
                 resolved = _resolve_book_href(ncx_path, src) if src else None
@@ -1722,7 +1734,8 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
     fallback_uuid = None
     chosen_uuid = None
 
-    metadata = list(next((child for child in opf_root if _strip_ns(child.tag) == "metadata"), ()))
+    metadata_node = _find_xml_child(opf_root, "metadata", OPF_NAMESPACE)
+    metadata = list(metadata_node) if metadata_node is not None else []
     titles: list[str] = []
     for elem in metadata:
         value = (elem.text or "").strip()
@@ -1747,17 +1760,9 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
     elif fallback_uuid:
         book_uuid = fallback_uuid
 
-    manifest_node = None
-    spine_node = None
-    guide_node = None
-    for child in list(opf_root):
-        t = _strip_ns(child.tag)
-        if t == "manifest":
-            manifest_node = child
-        elif t == "spine":
-            spine_node = child
-        elif t == "guide" and guide_node is None:
-            guide_node = child
+    manifest_node = _find_xml_child(opf_root, "manifest", OPF_NAMESPACE)
+    spine_node = _find_xml_child(opf_root, "spine", OPF_NAMESPACE)
+    guide_node = _find_xml_child(opf_root, "guide", OPF_NAMESPACE)
     if manifest_node is None or spine_node is None:
         raise ConversionError("Malformed OPF: missing manifest or spine")
 
@@ -1765,7 +1770,7 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
     manifest_ids: set[str] = set()
     manifest_count = 0
     for item in list(manifest_node):
-        if _strip_ns(item.tag) == "item":
+        if item.tag in {OPF_NAMESPACE + "item", "item"}:
             manifest_count += 1
             if manifest_count > MAX_BOOK_ENTRIES:
                 raise _ResourceLimitError(f"Too many manifest entries: {opf_path}")
@@ -1961,7 +1966,7 @@ def _spine_references(spine: ET.Element) -> list[tuple[str, bool]]:
     auxiliary_refs: list[tuple[str, bool]] = []
     count = 0
     for itemref in list(spine):
-        if _strip_ns(itemref.tag) != "itemref":
+        if itemref.tag not in {OPF_NAMESPACE + "itemref", "itemref"}:
             continue
         count += 1
         if count > MAX_BOOK_ENTRIES:
@@ -2381,7 +2386,7 @@ def _select_reading_start(nav_starts: list[ReadingStart], package: _EpubPackage,
         return anchor
     guide_starts: list[ReadingStart] = []
     for reference in package.guide:
-        if _strip_ns(reference.tag) != "reference" or reference.get("type") != "text":
+        if reference.tag not in {OPF_NAMESPACE + "reference", "reference"} or reference.get("type") != "text":
             continue
         target = _reading_start_target(package.opf_path, reference.get("href"), "EPUB2 guide")
         if target is not None:
