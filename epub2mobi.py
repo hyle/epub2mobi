@@ -97,6 +97,9 @@ MAX_CSS_PROCESSING_BYTES = 256 * 1024 * 1024
 MAX_CSS_PROCESSING_SELECTORS = 5000000
 MAX_OUTPUT_HTML_BYTES = 64 * 1024 * 1024  # Encoded MOBI HTML, including the footer TOC.
 
+# Optimization threshold only: longer CSS declaration lists still use the tokenizer.
+_CSS_SPLIT_MAX_CHARS = 4096
+
 # EXTH Types
 EXTH_AUTHOR = 100
 EXTH_TITLE = 503
@@ -239,9 +242,13 @@ def _tokenize_hints(*values: str) -> set[str]:
 
 
 def _has_heading_hint(elem: ET.Element) -> bool:
-    return elem.tag in {"p", "div"} and bool(
-        _tokenize_hints(elem.get("class", ""), elem.get("id", "")) & _HEADING_HINTS
-    )
+    if elem.tag not in {"p", "div"}:
+        return False
+    # Every recognized heading token contains either "head" or "title".
+    classes, identifier = elem.get("class", "").lower(), elem.get("id", "").lower()
+    if not any(token in value for value in (classes, identifier) for token in ("head", "title")):
+        return False
+    return bool(_tokenize_hints(classes, identifier) & _HEADING_HINTS)
 
 
 def _strip_ns(tag: str) -> str:
@@ -1338,6 +1345,15 @@ def _css_value(property_name: str, value: str) -> Optional[str]:
 
 def _css_declaration_values(text: str):
     """Yield declaration names and raw values outside comments and strings."""
+    # Split short, simple lists in C. Keep large lists streaming and leave
+    # comments, quoting, escaping and nesting to the stateful tokenizer.
+    if (len(text) <= _CSS_SPLIT_MAX_CHARS and "/*" not in text
+            and not any(ch in text for ch in "\\\"'()[]")):
+        for declaration in text.split(";"):
+            name, sep, value = declaration.partition(":")
+            if sep and ":" not in value:
+                yield name.strip().lower(), value.strip()
+        return
     for declaration, _ in _css_parts(text, ";"):
         parts = list(_css_parts(declaration, ":"))
         if len(parts) != 2 or parts[0][1] != ":":
@@ -2691,11 +2707,7 @@ class MinimalHtmlSanitizer:
             )
         table_tag = tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
         output_tag = tag if tag in _HTML_ALLOWED and not (flatten_table and table_tag) else None
-        # Hint tokens are only consumed for block alignment and p/div headings.
-        # Avoid tokenizing non-block inline content and avoid a second parse.
-        hints = (_tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
-                 if output_tag in _HTML_BLOCKS else set())
-        if output_tag in {"p", "div"} and hints & _HEADING_HINTS:
+        if output_tag in {"p", "div"} and _has_heading_hint(elem):
             output_tag = "h2"
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
         if self.styles.font_runs and output_tag in {"b", "i"}:
@@ -2732,7 +2744,10 @@ class MinimalHtmlSanitizer:
                 if href:
                     attr_str = f' href="{htmlmod.escape(href, quote=True)}"'
             elif output_tag in _HTML_BLOCKS:
-                align = style.get("text-align") or self._derive_alignment(attrs.get("style", ""), hints)
+                align = style.get("text-align")
+                if not align:
+                    hints = _tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
+                    align = self._derive_alignment(attrs.get("style", ""), hints)
                 if align:
                     attr_str = f' align="{align}"'
                 if output_tag in {"p", "div", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"} and "text-indent" in style:
