@@ -1470,9 +1470,13 @@ class _CssStyles:
                 floating = parent_float
             self.floats[elem] = floating
             self.font_runs |= not hidden and ("font-style" in local or "font-weight" in local)
-            style = dict(parent)
-            # Semantic markup provides local defaults, which authored CSS can reset.
+            # Child styles are read-only after resolution. Reuse inherited
+            # mappings for nodes with no local or semantic overrides.
             heading_hint = _has_heading_hint(elem)
+            style = (dict(parent) if local or heading_hint or
+                     elem.tag in {"b", "strong", "th", "h1", "h2", "h3", "h4", "h5", "h6", "i", "em"}
+                     else parent)
+            # Semantic markup provides local defaults, which authored CSS can reset.
             if elem.tag in {"b", "strong", "th", "h1", "h2", "h3", "h4", "h5", "h6"} or heading_hint:
                 style["font-weight"] = "bold"
             if elem.tag in {"i", "em"}:
@@ -2602,10 +2606,13 @@ class MinimalHtmlSanitizer:
     def _derive_alignment(style: str, hint_tokens: set[str]) -> Optional[str]:
         # This is a fallback hint, not margin layout: require the final complete
         # value on each side to be exactly auto, without interpreting lengths.
-        margins = {name: value.lower() for name, value in _css_declaration_values(style)
-                   if name in {"margin-left", "margin-right"}}
-        if margins.get("margin-left") == margins.get("margin-right") == "auto":
-            return "center"
+        # The fallback parser matters only when margin declarations can be
+        # present. Most inline styles set unrelated font or text properties.
+        if "margin-" in style.lower():
+            margins = {name: value.lower() for name, value in _css_declaration_values(style)
+                       if name in {"margin-left", "margin-right"}}
+            if margins.get("margin-left") == margins.get("margin-right") == "auto":
+                return "center"
         if hint_tokens & _CENTER_HINTS:
             return "center"
         if hint_tokens & _RIGHT_HINTS:
@@ -2696,7 +2703,7 @@ class MinimalHtmlSanitizer:
             return
         attrs = elem.attrib
         style = self.styles.styles.get(elem, {})
-        if tag != "body":
+        if tag != "body" and ("id" in attrs or "name" in attrs):
             self._inject_named_anchors(attrs.items(), in_link)
         if tag == "table":
             flatten_table = flatten_table or any(
@@ -2746,8 +2753,13 @@ class MinimalHtmlSanitizer:
             elif output_tag in _HTML_BLOCKS:
                 align = style.get("text-align")
                 if not align:
-                    hints = _tokenize_hints(attrs.get("class", ""), attrs.get("id", ""))
-                    align = self._derive_alignment(attrs.get("style", ""), hints)
+                    # Without authored style or naming hints there is no
+                    # possible fallback alignment to derive.
+                    inline, classes, identifier = (attrs.get("style", ""),
+                                                   attrs.get("class", ""), attrs.get("id", ""))
+                    if inline or classes or identifier:
+                        hints = _tokenize_hints(classes, identifier) if (classes or identifier) else set()
+                        align = self._derive_alignment(inline, hints)
                 if align:
                     attr_str = f' align="{align}"'
                 if output_tag in {"p", "div", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"} and "text-indent" in style:
