@@ -1409,27 +1409,38 @@ class _CssStyles:
         self.floats: dict[ET.Element, str] = {}
         self.hidden: set[ET.Element] = set()
         self.font_runs = False
+        # Selector resolution depends only on these three immutable strings,
+        # not on the element's position or its inherited styles. Bound memory
+        # for documents containing many distinct class/inline-style values.
+        selector_cache: dict[tuple[str, str, str], dict[str, str]] = {}
 
         def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
                     parent_hidden: bool = False, parent_display: str = "initial") -> None:
-            chosen = {name: (important, 0, order, value)
-                      for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
-            for cls in set(elem.get("class", "").split()):
-                for name, (important, order, value) in by_selector.get("." + cls, {}).items():
-                    candidate = (important, 1, order, value)
-                    if name not in chosen or candidate[:3] > chosen[name][:3]:
-                        chosen[name] = candidate
+            class_text = elem.get("class", "")
             inline_style = elem.get("style", "")
-            if inline_style:
-                for name, (important, value) in _css_declarations(inline_style).items():
-                    candidate = (important, 2, 0, value)
-                    if name not in chosen or candidate[:3] > chosen[name][:3]:
-                        chosen[name] = candidate
+            key = (elem.tag, class_text, inline_style)
+            selected = selector_cache.get(key)
+            if selected is None:
+                chosen = {name: (important, 0, order, value)
+                          for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
+                for cls in set(class_text.split()):
+                    for name, (important, order, value) in by_selector.get("." + cls, {}).items():
+                        candidate = (important, 1, order, value)
+                        if name not in chosen or candidate[:3] > chosen[name][:3]:
+                            chosen[name] = candidate
+                if inline_style:
+                    for name, (important, value) in _css_declarations(inline_style).items():
+                        candidate = (important, 2, 0, value)
+                        if name not in chosen or candidate[:3] > chosen[name][:3]:
+                            chosen[name] = candidate
+                selected = {name: value for name, (_, _, _, value) in chosen.items()}
+                if len(selector_cache) < 256:
+                    selector_cache[key] = selected
             local = {}
             alignment = elem.get("align", "").strip().lower()
             if (elem.tag in _HTML_BLOCKS or elem.tag == "body") and alignment in {"left", "right", "center", "justify"}:
                 local["text-align"] = alignment
-            local.update((name, value) for name, (_, _, _, value) in chosen.items())
+            local.update(selected)
             display = local.pop("display", "initial")
             if display == "inherit":
                 display = parent_display
@@ -2486,6 +2497,7 @@ class MinimalHtmlSanitizer:
         self.emitted_anchors: set[str] = set()
         self.list_layout: dict[ET.Element, tuple[Optional[str], str]] = {}
         self.has_reading_content = False
+        self._href_cache: dict[str, str] = {}
 
     @staticmethod
     def _list_label(number: int, kind: str) -> str:
@@ -2598,6 +2610,15 @@ class MinimalHtmlSanitizer:
                 self.emitted_anchors.add(target)
 
     def _rewrite_href(self, href: str) -> Optional[str]:
+        cached = self._href_cache.get(href)
+        if cached is not None:
+            return cached
+        value = self._rewrite_href_uncached(href)
+        if value is not None and len(self._href_cache) < 256:
+            self._href_cache[href] = value
+        return value
+
+    def _rewrite_href_uncached(self, href: str) -> Optional[str]:
         href = href.replace("\t", "").replace("\n", "").replace("\r", "").strip(_URL_TRIM_CHARACTERS)
         try:
             resolved = _resolve_book_href(self.current_path, href, self.base_url)
@@ -2628,6 +2649,7 @@ class MinimalHtmlSanitizer:
         return None
 
     def sanitize(self, body: ET.Element) -> str:
+        self._href_cache.clear()
         self.fed = _HtmlBuffer(self.output_limit)
         self.has_reading_content = False
         # The spine's file marker is emitted before this sanitizer runs.
