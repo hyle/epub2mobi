@@ -90,6 +90,8 @@ MAX_XML_ATTRIBUTE_CHARS = 65536
 MAX_BOOK_ENTRIES = 10000  # Each of manifest, spine, and navigation.
 MAX_SPINE_ELEMENTS = 1000000
 MAX_SPINE_BYTES = 64 * 1024 * 1024  # Source bytes, counting repeated occurrences.
+MAX_SPINE_FALLBACK_STEPS = 1000000
+MAX_SPINE_ALIAS_CHARS = 64 * 1024 * 1024  # Canonical paths, counting every occurrence.
 MAX_CSS_RULES = 10000
 MAX_CSS_SELECTORS = 50000
 MAX_DOCUMENT_CSS_BYTES = 4 * MAX_CSS_BYTES
@@ -1978,42 +1980,79 @@ def _spine_references(spine: ET.Element) -> list[tuple[str, bool]]:
     return linear_refs + auxiliary_refs
 
 
-def _select_spine_item(item_id: str, package: _EpubPackage, resources: _ResourceReader) -> tuple[str, tuple[str, ...]]:
-    chain: list[str] = []
-    visited: set[str] = set()
-    current = item_id
-    while True:
-        if current in visited:
-            raise ConversionError(f"Cyclic manifest fallback chain: {item_id}")
-        if current not in package.manifest:
-            raise ConversionError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
-        chain.append(current)
-        visited.add(current)
-        media_type = package.manifest[current].media_type.lower()
-        local = _resolve_book_href(package.opf_path, package.manifest[current].href) is not None
-        if local and media_type == "application/xhtml+xml":
-            break
-        fallback = package.manifest[current].fallback
-        if not fallback:
-            if not local:
-                raise ConversionError(f"Remote spine content is not supported: {package.manifest[current].href}")
-            if media_type == "image/svg+xml":
-                break  # Retain the existing SVG omission behavior.
-            raise ConversionError(f"Unsupported spine media type without readable fallback: {media_type}")
-        current = fallback
-    aliases = tuple(_resolve_manifest_path(package.base_dir, package.manifest[iid].href) for iid in chain
-                    if _resolve_book_href(package.opf_path, package.manifest[iid].href) is not None)
-    for iid in chain[:-1]:
-        resources.omit(_reported_media_path(package.opf_path, package.manifest[iid].href, package.manifest[iid].href),
-                        package.opf_path, "spine resource replaced by manifest fallback")
-    return current, aliases
+class _SpineSelector:
+    """Share immutable fallback resolutions and bound their book-wide cost."""
+
+    def __init__(self, package: _EpubPackage, resources: _ResourceReader):
+        self.package = package
+        self.resources = resources
+        self.steps = 0
+        self.alias_chars = 0
+        # Target ID, canonical aliases, traversed entries, alias characters.
+        self.cache: dict[str, tuple[str, tuple[str, ...], int, int]] = {}
+
+    def _reserve(self, steps: int = 0, alias_chars: int = 0) -> None:
+        if (self.steps + steps > MAX_SPINE_FALLBACK_STEPS
+                or self.alias_chars + alias_chars > MAX_SPINE_ALIAS_CHARS):
+            raise _ResourceLimitError("EPUB spine fallback processing limit exceeded")
+        self.steps += steps
+        self.alias_chars += alias_chars
+
+    def select(self, item_id: str) -> tuple[str, tuple[str, ...]]:
+        cached = self.cache.get(item_id)
+        if cached is not None:
+            current, aliases, steps, alias_chars = cached
+            # Cached aliases still cost work when indexing and resolving links.
+            self._reserve(steps, alias_chars)
+            return current, aliases
+
+        package = self.package
+        chain: list[str] = []
+        paths: list[str] = []
+        alias_chars = 0
+        visited: set[str] = set()
+        current = item_id
+        while True:
+            if current in visited:
+                raise ConversionError(f"Cyclic manifest fallback chain: {item_id}")
+            if current not in package.manifest:
+                raise ConversionError(f"Malformed OPF: spine/fallback item '{current}' is missing from manifest")
+            self._reserve(steps=1)
+            chain.append(current)
+            visited.add(current)
+            item = package.manifest[current]
+            media_type = item.media_type.lower()
+            local = _resolve_book_href(package.opf_path, item.href) is not None
+            if local:
+                path = _resolve_manifest_path(package.base_dir, item.href)
+                # Check before retaining another expanded path or tuple entry.
+                self._reserve(alias_chars=len(path))
+                alias_chars += len(path)
+                paths.append(path)
+            if local and media_type == "application/xhtml+xml":
+                break
+            if not item.fallback:
+                if not local:
+                    raise ConversionError(f"Remote spine content is not supported: {item.href}")
+                if media_type == "image/svg+xml":
+                    break  # Retain the existing SVG omission behavior.
+                raise ConversionError(f"Unsupported spine media type without readable fallback: {media_type}")
+            current = item.fallback
+        aliases = tuple(paths)
+        for iid in chain[:-1]:
+            href = package.manifest[iid].href
+            self.resources.omit(_reported_media_path(package.opf_path, href, href),
+                                package.opf_path, "spine resource replaced by manifest fallback")
+        self.cache[item_id] = current, aliases, len(chain), alias_chars
+        return current, aliases
 
 
 def _load_spine(package: _EpubPackage, resources: _ResourceReader) -> tuple[list[SpineItem], set[str]]:
     spine_items: list[SpineItem] = []
     svg_spine_paths: set[str] = set()
+    selector = _SpineSelector(package, resources)
     for spine_idx, (item_id, linear) in enumerate(_spine_references(package.spine), start=1):
-        item_id, aliases = _select_spine_item(item_id, package, resources)
+        item_id, aliases = selector.select(item_id)
         rel = package.manifest[item_id].href
         full = _resolve_manifest_path(package.base_dir, rel)
         if package.manifest[item_id].media_type.lower() == "image/svg+xml":
