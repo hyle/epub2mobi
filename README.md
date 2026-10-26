@@ -62,6 +62,8 @@ Missing, empty, or unsupported media are skipped and reported. Raster images wit
 
 ## Navigation and metadata
 
+OPF and NCX parsing prefers standard namespaced sections and fields, accepts unnamespaced compatibility elements, and ignores foreign lookalikes.
+
 EPUB3 navigation is preferred. A more complete NCX can replace an incomplete nav; this recovery comparison ignores grouping headings and counts duplicate sibling destinations once, using the nearest retained ancestor for children of skipped or duplicate entries. Displayed aliases and groups do not inflate recovery coverage. A spine-based TOC is generated only when no authored destinations resolve. Unresolved destinations produce warnings while valid entries and their hierarchy remain. Children of skipped entries attach to the nearest retained ancestor.
 
 Navigation labels retain text alternatives from embedded content: nonblank `alt` takes precedence over `title`, SVG can supply its own `<title>`, and `object`, `canvas`, `audio`, and `video` can supply fallback child text when no usable alternative exists. The enclosing link or grouping span's `title` is used when no label text remains, or replaces a partial label when embedded content has no usable alternative or fallback. Explicit `<br>` breaks become spaces, preserving word boundaries in both the logical and in-book TOCs. Navigation images are not loaded just to extract labels. Unlinked grouping headings use their first retained descendant's destination; groups without a retained destination are skipped. Authored aliases retain their labels and child branches even when they share a destination.
@@ -140,6 +142,7 @@ Size and processing limits keep malformed or unusually large books from consumin
 | XML attribute names and values | 65,536 characters each; namespace declarations count as attributes |
 | Manifest / spine / each navigation document | 10,000 entries each, counting raw declarations before validation or filtering |
 | Spine processing | 64 MiB of source data and 1,000,000 elements, counting every occurrence |
+| Spine fallback processing | 1,000,000 traversed entries and 64 Mi characters of canonical alias paths, counting every occurrence, including cached resolutions |
 | Image or cover | 64 MiB each |
 | Style block or stylesheet | 1 MiB, 10,000 top-level rules, 50,000 selectors |
 | Combined style blocks and linked stylesheets per document | 4 MiB of source data, 50,000 supported selector entries |
@@ -155,7 +158,7 @@ XML structure is checked before tree construction, including locally resolved XH
 
 The byte cache holds at most 8 MiB and 128 entries. A separate parsed XML/XHTML cache holds at most 8 MiB of source data, 65,536 elements, and 128 entries. Larger documents within the conversion limits are processed without caching. Cached spine trees are copied before editing.
 
-Fallback aliases share each document's fragment map, avoiding a separate set of fragment entries for every alias.
+Repeated spine references share immutable fallback resolutions while retaining independent document trees. Fallback steps and alias characters are checked before retaining expanded paths or loading the next spine document; overlapping chains share the same book-wide processing limits. Fallback aliases share each document's fragment map, avoiding a separate set of fragment entries for every alias.
 
 </details>
 
