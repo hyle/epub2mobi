@@ -3172,24 +3172,27 @@ class MobiWriter:
         max_len = min(10, len(data) - pos)
         if max_len < 3:
             return 0, 0
-        # Preserve the single-lookup fast path for long repetitions.
-        hit = data.rfind(data[pos:pos + max_len], window_start, pos)
-        if hit != -1:
-            return pos - hit, max_len
-        # No length-3 match implies no longer match.
+        # Start with the rightmost three-byte match, then lengthen only when
+        # an earlier occurrence supports a longer match. This retains the
+        # original longest-match and nearest-match tie-breaking behavior.
         hit = data.rfind(data[pos:pos + 3], window_start, pos)
         if hit == -1:
             return 0, 0
-        best_hit, best_len = hit, 3
-        low, high = 4, max_len - 1
-        while low <= high:
-            mid = (low + high) // 2
-            hit = data.rfind(data[pos:pos + mid], window_start, pos)
+        best_hit = hit
+        length = 3
+        bound = min(max_len, pos - hit)
+        while length < bound and data[hit + length] == data[pos + length]:
+            length += 1
+        best_len = length
+        while best_len < max_len:
+            hit = data.rfind(data[pos:pos + best_len + 1], window_start, pos)
             if hit == -1:
-                high = mid - 1
-            else:
-                best_hit, best_len = hit, mid
-                low = mid + 1
+                break
+            length = best_len + 1
+            bound = min(max_len, pos - hit)
+            while length < bound and data[hit + length] == data[pos + length]:
+                length += 1
+            best_len, best_hit = length, hit
         return pos - best_hit, best_len
 
     @staticmethod
@@ -3201,14 +3204,25 @@ class MobiWriter:
         i = 0
         n = len(data)
         best_backref = MobiWriter._best_backref
+        previous_long_match = False
         while i < n:
-            distance, length = best_backref(data, i)
+            # After a full-length match, check the complete legal backreference
+            # window using the C-level search, avoiding a Python-level scan
+            # when a long repeat is farther than 64 bytes away.
+            hit = (data.rfind(data[i:i + 10], max(0, i - 2047), i)
+                   if previous_long_match and i + 10 <= n else -1)
+            if hit != -1:
+                distance, length = i - hit, 10
+            else:
+                distance, length = best_backref(data, i)
             if length >= 3:
                 code = (distance << 3) | (length - 3)
                 out.append(0x80 | ((code >> 8) & 0x3F))
                 out.append(code & 0xFF)
                 i += length
+                previous_long_match = length == 10
                 continue
+            previous_long_match = False
 
             if i + 1 < n and data[i] == 0x20 and 0x40 <= data[i + 1] <= 0x7F:
                 out.append(data[i + 1] | 0x80)
