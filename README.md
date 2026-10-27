@@ -58,6 +58,8 @@ For Kindles that support MOBI files, this tool provides a simple, offline EPUB â
 
 Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
+PalmDOC compression uses a heuristic match search to favor conversion speed. Compared with exhaustive matching, it can produce larger MOBI files and different compressed bytes while preserving the generated HTML after decompression. Conversion time and file size depend on the book's content.
+
 Missing, empty, or unsupported media are skipped and reported. Raster images with mismatched signatures are also omitted. When an image cannot be embedded, nonblank `alt` text is retained as escaped inline text with supported formatting. Missing, empty, or whitespace-only alternatives add no text; embedded images do not duplicate their alternatives, and hidden images remain hidden. Conversion shows a resource omission count; `--report-omissions` adds resource paths, source documents, and reasons, including remote manifest resources such as stylesheets and documents. CSS background assets are not inspected.
 
 ## Navigation and metadata
