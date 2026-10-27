@@ -3196,6 +3196,31 @@ class MobiWriter:
         return pos - best_hit, best_len
 
     @staticmethod
+    def _fast_backref(data: bytes, pos: int) -> tuple[int,int]:
+        # Fast nearby match, with one bounded search for a longer 4-byte match.
+        # The original exhaustive matcher remains for highly repetitive records.
+        window_start = max(0, pos - 2047)
+        max_len = min(10, len(data) - pos)
+        if max_len < 3:
+            return 0, 0
+        hit = data.rfind(data[pos:pos + 3], window_start, pos)
+        if hit < 0:
+            return 0, 0
+        length = 3
+        bound = min(max_len, pos - hit)
+        while length < bound and data[hit + length] == data[pos + length]:
+            length += 1
+        if length == 3 and max_len >= 4:
+            earlier = data.rfind(data[pos:pos + 4], window_start, pos)
+            if earlier >= 0:
+                hit = earlier
+                length = 4
+                bound = min(max_len, pos - hit)
+                while length < bound and data[hit + length] == data[pos + length]:
+                    length += 1
+        return pos - hit, length
+
+    @staticmethod
     def _compress_palmdoc(data: bytes) -> bytes:
         if not data:
             return b""
@@ -3203,7 +3228,13 @@ class MobiWriter:
         out = bytearray()
         i = 0
         n = len(data)
-        best_backref = MobiWriter._best_backref
+        # Repeated long fragments benefit from exhaustive matching. Two C-level
+        # count probes guard that case without building a Python index.
+        repeated = (n >= 128 and
+                    (data.count(data[:32]) >= 3 or
+                     data.count(data[n // 2:n // 2 + 32]) >= 3))
+        best_backref = (MobiWriter._best_backref if repeated
+                        else MobiWriter._fast_backref)
         previous_long_match = False
         while i < n:
             # After a full-length match, check the complete legal backreference
