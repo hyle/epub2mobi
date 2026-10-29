@@ -44,7 +44,7 @@ Options can be combined. Use `--help` for the CLI reference.
 
 ## Why MOBI6?
 
-For Kindles that support MOBI files, this tool provides a simple, offline EPUB → MOBI conversion path without Calibre or external dependencies.
+MOBI6 provides the essentials for reflowable books: text, chapter navigation, linked notes, basic formatting, and images. Advanced typography, embedded fonts, and fixed layouts are outside the converter's scope; the emphasis is on preserving readable content and navigation.
 
 ## What it preserves
 
@@ -112,6 +112,8 @@ Inline raster images and covers must be declared local JPEG, PNG, or GIF resourc
 
 Relative links and media honor the first XHTML `base` with an `href`, including URL-encoded paths. Parent references within the EPUB are allowed; traversal above the archive root is rejected, including encoded and backslash forms. Invalid required package or spine paths stop conversion; invalid optional links and resources are skipped and reported. Repeated spine documents retain independent formatting and self-links; links from other documents to a shared path target its first occurrence. Repeated source IDs keep all text and target the first retained occurrence, emitting each generated anchor once.
 
+Relative references under opaque or unsupported base schemes are skipped instead of being interpreted as archive-local paths. Absolute `http`, `https`, and `mailto` links remain available. Flattened sections, definition lists, and complex tables use supported block elements to retain visible boundaries. Alignment and indentation also apply to direct body text and inline-only body content.
+
 Duplicate manifest IDs and declarations resolving to the same local resource path are rejected; queries and fragments do not distinguish local resources. Shared fallback targets and repeated spine references are supported. ZIP member names are checked without repairing paths: controls, absolute paths, backslashes, empty or dot segments, exact duplicates, and file/directory conflicts are rejected. Names differing only by case or Unicode canonical normalization produce one warning per archive; exact names remain distinct for lookup.
 
 Fallback relationships are checked only when needed to select spine content. Broken unused chains do not block conversion, and readable local XHTML is accepted even if its unused fallback is broken. Missing targets or cycles stop conversion when encountered while selecting a chapter.
@@ -136,9 +138,10 @@ Size and processing limits keep malformed or unusually large books from consumin
 | Archive file | 512 MiB |
 | ZIP central directory | 16 MiB |
 | ZIP entries | 10,000, including unused and duplicate entries |
+| ZIP member path depth / total components | 256 / 100,000, counting implicit directories and repeated prefixes per member |
 | Total declared uncompressed ZIP data | 1 GiB |
 | Unique physical members read | 256 MiB combined |
-| Archive read work | 512 MiB of declared compressed + uncompressed bytes |
+| Archive read work | 512 MiB of declared compressed + uncompressed bytes, plus one output-probe byte per DEFLATE read |
 | XML / spine XHTML document | 8 MiB / 16 MiB |
 | XML structure per document | 100,000 elements, 200,000 attributes, depth 256 (root depth zero) |
 | XML attribute names and values | 65,536 characters each; namespace declarations count as attributes |
@@ -156,11 +159,15 @@ Only stored and DEFLATE ZIP entries are accepted. Archive size, central-director
 
 Unique-member accounting survives cache eviction. Read work charges failed reads and rereads; cache hits are free. Spine and CSS processing count repeated references even when cached. Each resource use still enforces its size limit.
 
+DEFLATE output is bounded at the decoder before the ZIP reader can truncate it to a forged declaration. Understated sizes are rejected; overstated sizes remain accepted when the actual stream and CRC are valid. Python ZIP readers without the required per-stream decoder hook fail safely. Archive path limits are checked before building directory indexes, including their Unicode-normalized lookup nodes.
+
 XML structure is checked before tree construction, including locally resolved XHTML attributes. The combined length of namespace-expanded element and attribute names is bounded by the document's XML byte limit. HTML is checked during emission and before compression.
 
 The byte cache holds at most 8 MiB and 128 entries. A separate parsed XML/XHTML cache holds at most 8 MiB of source data, 65,536 elements, and 128 entries. Larger documents within the conversion limits are processed without caching. Cached spine trees are copied before editing.
 
 Repeated spine references share immutable fallback resolutions while retaining independent document trees. Fallback steps and alias characters are checked before retaining expanded paths or loading the next spine document; overlapping chains share the same book-wide processing limits. Fallback aliases share each document's fragment map, avoiding a separate set of fragment entries for every alias.
+
+NCX fallback labels are indexed by path, preserving the first matching label in authored NCX order. Internal-link alias membership uses a set, avoiding repeated linear searches through fallback chains.
 
 </details>
 
