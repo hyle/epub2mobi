@@ -23,7 +23,7 @@ import zipfile
 import zlib
 from collections import OrderedDict
 from collections.abc import Mapping
-from copy import deepcopy
+from copy import copy, deepcopy
 # ElementTree is used to keep the converter dependency-free.
 # Untrusted XML is size-limited and pre-screened for unsafe declarations in
 # _parse_xml(). Applications requiring a hardened external parser may use
@@ -77,6 +77,8 @@ MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10000
+MAX_ARCHIVE_PATH_DEPTH = 256
+MAX_ARCHIVE_PATH_COMPONENTS = 100000  # Includes repeated implicit directory components.
 MAX_ZIP_DIRECTORY_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_DECOMPRESSION_WORK_BYTES = 512 * 1024 * 1024
@@ -764,6 +766,11 @@ def _resolve_epub_url(base_url: str, href: str) -> urllib.parse.SplitResult:
     """Resolve local URLs without letting urljoin erase traversal above root."""
     base = _split_epub_url(base_url)
     reference = _split_epub_url(href)
+    if (base.scheme and not reference.scheme
+            and (base.scheme not in {"http", "https"} or not base.netloc)):
+        # urljoin can drop an opaque base's scheme, making relative references
+        # appear archive-local. Absolute references retain their own scheme.
+        raise ConversionError(f"Relative reference under unsupported EPUB base URL: {base_url}")
     if base.scheme or base.netloc or reference.scheme or reference.netloc:
         return urllib.parse.urlsplit(urllib.parse.urljoin(base_url, href))
     base_path = urllib.parse.unquote(base.path).replace("\\", "/")
@@ -1101,6 +1108,9 @@ def _check_zip_compression(info: zipfile.ZipInfo) -> None:
 def _validate_archive_member_name(info: zipfile.ZipInfo) -> list[str]:
     # Unlike URI resolution, physical member names must not be repaired.
     raw = info.orig_filename
+    depth = raw.count("/") + (0 if raw.endswith("/") else 1)
+    if depth > MAX_ARCHIVE_PATH_DEPTH:
+        raise _ResourceLimitError("EPUB archive member path too deep")
     if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in raw):
         raise ConversionError(f"EPUB archive member contains control characters: {raw!r}")
     parts = (raw[:-1] if raw.endswith("/") else raw).split("/")
@@ -1174,6 +1184,7 @@ def _validate_archive(archive: zipfile.ZipFile) -> None:
     if len(entries) > MAX_ARCHIVE_ENTRIES:
         raise ConversionError(f"EPUB archive has too many entries: {len(entries)} > {MAX_ARCHIVE_ENTRIES}")
     declared_total = 0
+    components = 0
     seen_names: set[str] = set()
     # Component nodes include implicit directories. Integer parent IDs avoid
     # retaining every full prefix of a deeply nested path.
@@ -1188,6 +1199,9 @@ def _validate_archive(archive: zipfile.ZipFile) -> None:
                 f"EPUB archive declared content too large: exceeds {MAX_ARCHIVE_UNCOMPRESSED_BYTES} bytes"
             )
         parts = _validate_archive_member_name(info)
+        components += len(parts)
+        if components > MAX_ARCHIVE_PATH_COMPONENTS:
+            raise _ResourceLimitError("EPUB archive has too many path components")
         raw = info.orig_filename
         if raw in seen_names:
             raise ConversionError(f"Duplicate EPUB archive member: {raw!r}")
@@ -1217,6 +1231,36 @@ def _validate_archive(archive: zipfile.ZipFile) -> None:
         )
 
 
+class _BoundedZipInflator:
+    """Cap DEFLATE output before ZipExtFile can discard undeclared bytes."""
+
+    def __init__(self, decoder, limit: int, path: str):
+        self.decoder = decoder
+        self.limit = limit
+        self.path = path
+        self.produced = 0
+
+    def __getattr__(self, name):
+        return getattr(self.decoder, name)
+
+    def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+        # One extra byte detects underdeclared output. It is reserved in the
+        # reader's work budget before opening the member, including failed reads.
+        remaining = self.limit + 1 - self.produced
+        output = self.decoder.decompress(data, min(max_length or remaining, remaining))
+        self.produced += len(output)
+        if self.produced > self.limit:
+            raise ConversionError(f"EPUB member expands beyond its declared size: {self.path}")
+        return output
+
+    def flush(self) -> bytes:
+        # At genuine DEFLATE EOF all output has already been returned. Never
+        # use an unbounded flush to recover output from a truncated stream.
+        if not self.decoder.eof:
+            raise zipfile.BadZipFile(f"Truncated DEFLATE stream: {self.path}")
+        return b""
+
+
 def _read_zip_member(
     z: zipfile.ZipFile,
     member_path: str,
@@ -1235,6 +1279,8 @@ def _read_zip_member(
             raise KeyError(member_path) from e
 
     _check_zip_compression(info)
+    if info.compress_type == zipfile.ZIP_STORED and info.compress_size > info.file_size:
+        raise ConversionError(f"Stored EPUB member exceeds its declared size: {member_path}")
 
     if info.file_size > size_limit:
         raise ConversionError(
@@ -1251,8 +1297,26 @@ def _read_zip_member(
 
     read_errors = (NotImplementedError, RuntimeError, EOFError, UnicodeDecodeError, zlib.error)
     try:
-        with z.open(info) as member:
+        read_info = info
+        if info.compress_type == zipfile.ZIP_DEFLATED:
+            read_info = copy(info)
+            # Keep ZipExtFile reading after the declared output length, so
+            # later DEFLATE blocks cannot hide behind an early matching CRC.
+            read_info.file_size += 1
+        with z.open(read_info) as member:
+            inflator = None
+            if info.compress_type == zipfile.ZIP_DEFLATED:
+                # ZipExtFile's public API truncates output to the declaration.
+                # Guard its decoder per instance; fail closed if this Python
+                # implementation does not expose the required integration point.
+                decoder = getattr(member, "_decompressor", None)
+                if decoder is None or not hasattr(decoder, "unconsumed_tail") or not hasattr(decoder, "eof"):
+                    raise ConversionError("This Python ZIP reader cannot safely bound DEFLATE output")
+                inflator = _BoundedZipInflator(decoder, info.file_size, member_path)
+                member._decompressor = inflator
             data = member.read(size_limit + 1)
+            if inflator is not None and not inflator.eof:
+                raise zipfile.BadZipFile(f"Truncated DEFLATE stream: {member_path}")
     except read_errors as e:
         raise ConversionError(f"Cannot read EPUB member {member_path}: {e}") from e
     if len(data) > size_limit:
@@ -1862,7 +1926,7 @@ class _ResourceReader:
             )
         # Reserve both input and output work before opening. Failed reads and
         # rereads consume work; serving cached bytes or trees does not.
-        work = info.compress_size + info.file_size
+        work = info.compress_size + info.file_size + (info.compress_type == zipfile.ZIP_DEFLATED)
         if self.work_bytes + work > MAX_DECOMPRESSION_WORK_BYTES:
             raise _ResourceLimitError(
                 f"EPUB decompression work too large: reading {path} would exceed "
@@ -2304,6 +2368,10 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
     parts = _HtmlBuffer()
     fallback_toc: list[ResolvedTocEntry] = []
     has_reading_content = False
+    ncx_labels: dict[str, tuple[int, str]] = {}
+    for order, target in enumerate(ncx_targets):
+        if target.path is not None and target.fragment is None:
+            ncx_labels.setdefault(target.path, (order, target.label))
     for item in spine_items:
         parts.append(f'<a name="{item.anchor}" id="{item.anchor}"></a>')
         sanitizer = MinimalHtmlSanitizer(
@@ -2321,7 +2389,14 @@ def _render_spine(package: _EpubPackage, spine_items: list[SpineItem], index: _S
         clean = sanitizer.sanitize(item.body)
         has_reading_content |= sanitizer.has_reading_content
         # Derive fallback labels from the normalized reading text too.
-        ncx_title = next((target.label for target in ncx_targets if target.path in item.aliases and target.fragment is None), None)
+        # Work is linear in alias occurrences (already budgeted), rather than
+        # aliases times NCX entries. Preserve the first matching NCX entry.
+        first_label = None
+        for path in item.aliases:
+            candidate = ncx_labels.get(path)
+            if candidate is not None and (first_label is None or candidate[0] < first_label[0]):
+                first_label = candidate
+        ncx_title = first_label[1] if first_label is not None else None
         guessed_title = _extract_title(item.document)
         chapter_title = ncx_title or guessed_title
         if (
@@ -2704,12 +2779,12 @@ class MinimalHtmlSanitizer:
 
         target_path, fragment = resolved
         if fragment:
-            exact = (self.fragment_anchors.get(fragment) if target_path in self.current_aliases else
+            exact = (self.fragment_anchors.get(fragment) if target_path in self._current_alias_set else
                      self.fragment_anchor_map.get((target_path, fragment)))
             if exact:
                 return f"#{exact}"
 
-        fallback = (self.file_anchor if target_path in self.current_aliases else
+        fallback = (self.file_anchor if target_path in self._current_alias_set else
                     self.file_anchor_map.get(target_path))
         if fallback:
             return f"#{fallback}"
@@ -2717,6 +2792,7 @@ class MinimalHtmlSanitizer:
 
     def sanitize(self, body: ET.Element) -> str:
         self._href_cache.clear()
+        self._current_alias_set = frozenset(self.current_aliases)
         self.fed = _HtmlBuffer(self.output_limit)
         self.has_reading_content = False
         # The spine's file marker is emitted before this sanitizer runs.
@@ -2757,7 +2833,18 @@ class MinimalHtmlSanitizer:
                 for child in elem.iter()
             )
         table_tag = tag in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
-        output_tag = tag if tag in _HTML_ALLOWED and not (flatten_table and table_tag) else None
+        output_tag = tag if tag in _HTML_ALLOWED else None
+        if tag in _HTML_FLATTENED_BLOCKS or (flatten_table and table_tag):
+            # Source newlines collapse in HTML; supported blocks preserve the
+            # boundaries of definitions, sections, and complex table cells/rows.
+            output_tag = "div"
+        if (tag == "body" and ("text-align" in style or "text-indent" in style)
+                and ((elem.text or "").strip() or any(
+                    (child.tail or "").strip() or
+                    (not _suppressed_element(child) and child.tag not in _HTML_BLOCKS
+                     and child.tag not in _HTML_FLATTENED_BLOCKS)
+                    for child in elem))):
+            output_tag = "div"
         if output_tag in {"p", "div"} and _has_heading_hint(elem):
             output_tag = "h2"
         output_tag = {"strong": "b", "em": "i"}.get(output_tag, output_tag)
@@ -2811,10 +2898,6 @@ class MinimalHtmlSanitizer:
             if output_tag in _HTML_BLOCKS:
                 self._ensure_block_sep()
             self.fed.append(f"<{output_tag}{attr_str}>")
-        elif table_tag:
-            self.fed.append(" ")
-        elif tag in _HTML_FLATTENED_BLOCKS:
-            self._ensure_block_sep()
         if list_label:
             self._emit_text(list_label, style, reading_content=False)
         if elem.text:
@@ -2827,10 +2910,6 @@ class MinimalHtmlSanitizer:
             self.fed.append(f"</{output_tag}>")
             if output_tag in _HTML_BLOCKS:
                 self.fed.append("\n")
-        elif table_tag:
-            self.fed.append("\n" if tag in {"tr", "table"} else " ")
-        elif tag in _HTML_FLATTENED_BLOCKS:
-            self._ensure_block_sep()
 
 
 @contextmanager
@@ -3665,9 +3744,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     infile = Path(args.input_epub)
-    outfile = Path(args.output_mobi) if args.output_mobi else infile.with_suffix(".mobi")
-
     try:
+        if args.output_mobi:
+            outfile = Path(args.output_mobi)
+        else:
+            try:
+                outfile = infile.with_suffix(".mobi")
+            except ValueError as e:
+                raise ConversionError(f"Cannot derive an output filename from input path: {infile}") from e
         if outfile.exists() and infile.samefile(outfile):
             raise ConversionError("Output path resolves to the input EPUB; choose a different output path")
         epub_data = parse_epub(infile)
