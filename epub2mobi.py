@@ -90,6 +90,7 @@ MAX_XML_ELEMENTS = 100000
 MAX_XML_ATTRIBUTES = 200000
 MAX_XML_ATTRIBUTE_CHARS = 65536
 MAX_BOOK_ENTRIES = 10000  # Each of manifest, spine, and navigation.
+MAX_MANIFEST_PATH_CHARS = 16 * 1024 * 1024  # Expanded canonical local paths.
 MAX_SPINE_ELEMENTS = 1000000
 MAX_SPINE_BYTES = 64 * 1024 * 1024  # Source bytes, counting repeated occurrences.
 MAX_SPINE_FALLBACK_STEPS = 1000000
@@ -1442,6 +1443,8 @@ def _css_declaration_values(text: str):
 def _css_declarations(text: str) -> dict[str, tuple[bool, str]]:
     declarations: dict[str, tuple[bool, str]] = {}
     for name, raw_value in _css_declaration_values(text):
+        if name not in {"font-weight", "font-style", "text-align", "text-indent", "float", "display"}:
+            continue
         annotation = re.search(r"!\s*important\s*$", raw_value, re.IGNORECASE)
         important = annotation is not None
         if annotation is not None:
@@ -1478,11 +1481,12 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
                     selector_count += prelude.count(",") + 1
                     if selector_count > MAX_CSS_SELECTORS:
                         raise _ResourceLimitError("Too many CSS selectors")
-                    declarations = _css_declarations("".join(body) + part)
                     selectors = [selector.strip() for selector in prelude.split(",")]
-                    # A selector list containing unsupported syntax is skipped whole.
-                    if declarations and all(re.fullmatch(r"\.?(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*", s) for s in selectors):
-                        rules.extend((s if s.startswith(".") else s.lower(), declarations) for s in selectors)
+                    # Reject whole unsupported selector lists before parsing declarations.
+                    if all(re.fullmatch(r"\.?(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*", s) for s in selectors):
+                        declarations = _css_declarations("".join(body) + part)
+                        if declarations:
+                            rules.extend((s if s.startswith(".") else s.lower(), declarations) for s in selectors)
             if depth == 1 and not nested:
                 body.append(part + delimiter)
     return rules
@@ -1507,6 +1511,7 @@ class _CssStyles:
         # not on the element's position or its inherited styles. Bound memory
         # for documents containing many distinct class/inline-style values.
         selector_cache: dict[tuple[str, str, str], dict[str, str]] = {}
+        inline_cache: dict[str, dict[str, tuple[bool, str]]] = {}
 
         def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
                     parent_hidden: bool = False, parent_display: str = "initial") -> None:
@@ -1523,7 +1528,12 @@ class _CssStyles:
                         if name not in chosen or candidate[:3] > chosen[name][:3]:
                             chosen[name] = candidate
                 if inline_style:
-                    for name, (important, value) in _css_declarations(inline_style).items():
+                    declarations = inline_cache.get(inline_style)
+                    if declarations is None:
+                        declarations = _css_declarations(inline_style)
+                        if len(inline_cache) < 1024:
+                            inline_cache[inline_style] = declarations
+                    for name, (important, value) in declarations.items():
                         candidate = (important, 2, 0, value)
                         if name not in chosen or candidate[:3] > chosen[name][:3]:
                             chosen[name] = candidate
@@ -1854,6 +1864,7 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
                     fallback=item.get("fallback"),
                 )
     manifest_paths: dict[str, str] = {}
+    manifest_path_chars = 0
     for iid, item in manifest.items():
         try:
             resolved = _resolve_book_href(opf_path, item.href)
@@ -1868,6 +1879,11 @@ def _read_package(resources: _ResourceReader) -> _EpubPackage:
                     f"Duplicate manifest local resource path: {manifest_paths[path]!r} and {iid!r} "
                     f"both resolve to {path!r}"
                 )
+            # Short hrefs can expand a long shared OPF directory prefix.
+            # Bound retained paths separately from source XML and spine aliases.
+            manifest_path_chars += len(path)
+            if manifest_path_chars > MAX_MANIFEST_PATH_CHARS:
+                raise _ResourceLimitError("EPUB manifest resolved paths too large")
             manifest_paths[path] = iid
 
     return _EpubPackage(
@@ -2917,7 +2933,12 @@ def _atomic_output(output_file: Union[str, Path]) -> Iterator[BinaryIO]:
     """Close a complete temporary file before replacing the destination."""
     # Preserve existing symlink targets and keep the temporary file on the
     # destination's filesystem, for both conversion and USB deployment.
-    output_path = Path(output_file).resolve()
+    try:
+        output_path = Path(output_file).resolve()
+    except RuntimeError as e:
+        # Older pathlib versions report symlink loops as RuntimeError rather
+        # than OSError. Translate only failures at this path-resolution boundary.
+        raise ConversionError(f"Cannot resolve output path: {output_file}") from e
     try:
         output_mode = stat.S_IMODE(output_path.stat().st_mode)
     except FileNotFoundError:
