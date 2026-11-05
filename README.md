@@ -4,6 +4,8 @@
 
 Download the script, run it, and bring your books to your Kindle.
 
+**[Also try the web version](https://equi.pages.dev/epub2mobi/)** — Convert EPUB files directly in your browser. Your files stay local.
+
 ## Install and use
 
 Requires **Python 3.9+**. No Python packages or external converters to install.
