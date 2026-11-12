@@ -4,8 +4,6 @@
 
 Download the script, run it, and bring your books to your Kindle.
 
-**[Also try the web version](https://equi.pages.dev/epub2mobi/)** — Convert EPUB files directly in your browser. Your files stay local.
-
 ## Install and use
 
 Requires **Python 3.9+**. No Python packages or external converters to install.
@@ -88,7 +86,7 @@ The MOBI header declares Windows-1252. Body characters outside that encoding use
 
 ## Supported formatting
 
-Styles come from XHTML `<style>` blocks, local UTF-8 stylesheets (an optional BOM is accepted), and inline `style` attributes. Selectors are single ASCII element names (`p`) or class names (`.italic`); class names are case-sensitive. Comma-separated lists work when every selector is supported.
+Styles come from XHTML `<style>` blocks, local UTF-8 stylesheets (an optional BOM is accepted), and inline `style` attributes. Selectors support ASCII element names (`p`), class names (`.italic`), and an element with one class (`p.italic`). Element names are case-insensitive; class names are case-sensitive. Comma-separated lists work when every selector is supported.
 
 | Property | Supported values |
 | --- | --- |
@@ -98,11 +96,11 @@ Styles come from XHTML `<style>` blocks, local UTF-8 stylesheets (an optional BO
 | `text-indent` | `0`, nonnegative lengths in `em` or `pt` |
 | `display` | `none` suppresses reading content; recognized ordinary display values reset it without emulating layout |
 
-For supported properties, `!important` declarations take precedence over normal declarations. Within the same importance level, precedence is **inline style > class rule > element rule**, separately for each property; later declarations win ties in document order. Text properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
+For supported properties, `!important` declarations take precedence over normal declarations. Within the same importance level, precedence is **inline style > element.class rule > class rule > element rule**, separately for each property; later declarations win ties in document order. Text properties inherit; explicit `inherit` is supported. Semantic tags supply defaults that CSS can override, including resets to normal weight or style. Headings and table headers may become ordinary paragraphs or cells to allow those resets.
 
 An element with a `hidden` attribute (regardless of its value), supported `display:none`, or a hidden ancestor is excluded from reading content. Hidden inline images are not loaded; hidden fragments cannot supply TOC or reading-start destinations. Text outside a hidden subtree is retained. `display` does not inherit unless requested with `inherit`; `initial` and `unset` reset it. A child cannot undo an ancestor's hiddenness. Hidden navigation metadata remains available, and a declared cover is handled independently.
 
-Recognized `align` attributes (`left`, `right`, `center`, `justify`) provide local alignment hints that authored CSS can override. Common class/ID hints and valid inline auto margins provide alignment when no computed alignment applies. Compound, descendant, ID, and pseudo selectors, other properties, and at-rule blocks such as `@import` and `@media` are skipped. Alternate or disabled stylesheets, and those whose `media` is neither empty nor `all`, are skipped. Missing, remote, or non-UTF-8 stylesheets are reported.
+Recognized `align` attributes (`left`, `right`, `center`, `justify`) provide local alignment hints that authored CSS can override. Common class/ID hints and valid inline auto margins provide alignment when no computed alignment applies. Other compound selectors (such as `.a.b` or `p.a.b`), descendant, ID, and pseudo selectors, other properties, and at-rule blocks such as `@import` and `@media` are skipped. Alternate or disabled stylesheets, and those whose `media` is neither empty nor `all`, are skipped. Missing, remote, or non-UTF-8 stylesheets are reported.
 
 `float` is inspected only to repair detached text drop caps. A left-floating initial can join the immediately following paragraph when its continuation starts with a lowercase or uncased letter and the structure makes the join unambiguous. Formatting, accents, and link targets are preserved; the initial becomes ordinary inline text. Explicit spaces at the join, including nonbreaking spaces, prevent joining; XML newline indentation may be removed when joining is safe. Image initials and CSS-generated letters are not reconstructed, and general float layout is unsupported.
 
@@ -148,6 +146,7 @@ Size and processing limits keep malformed or unusually large books from consumin
 | XML structure per document | 100,000 elements, 200,000 attributes, depth 256 (root depth zero) |
 | XML attribute names and values | 65,536 characters each; namespace declarations count as attributes |
 | Manifest / spine / each navigation document | 10,000 entries each, counting raw declarations before validation or filtering |
+| Resolved manifest paths | 16 Mi characters of canonical local paths, including repeated OPF directory prefixes |
 | Spine processing | 64 MiB of source data and 1,000,000 elements, counting every occurrence |
 | Spine fallback processing | 1,000,000 traversed entries and 64 Mi characters of canonical alias paths, counting every occurrence, including cached resolutions |
 | Image or cover | 64 MiB each |
@@ -164,6 +163,8 @@ Unique-member accounting survives cache eviction. Read work charges failed reads
 DEFLATE output is bounded at the decoder before the ZIP reader can truncate it to a forged declaration. Understated sizes are rejected; overstated sizes remain accepted when the actual stream and CRC are valid. Python ZIP readers without the required per-stream decoder hook fail safely. Archive path limits are checked before building directory indexes, including their Unicode-normalized lookup nodes.
 
 XML structure is checked before tree construction, including locally resolved XHTML attributes. The combined length of namespace-expanded element and attribute names is bounded by the document's XML byte limit. HTML is checked during emission and before compression.
+
+Resolved manifest paths are checked before adding each path to the lookup map, bounding expansion of shared directory prefixes independently of source XML size. External and invalid optional references add no paths to this map.
 
 The byte cache holds at most 8 MiB and 128 entries. A separate parsed XML/XHTML cache holds at most 8 MiB of source data, 65,536 elements, and 128 entries. Larger documents within the conversion limits are processed without caching. Cached spine trees are copied before editing.
 
