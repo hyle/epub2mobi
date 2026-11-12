@@ -1458,7 +1458,7 @@ def _css_declarations(text: str) -> dict[str, tuple[bool, str]]:
 def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
     """Read flat rules, skipping entire at-rule and malformed nested blocks."""
     identifier = r"(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*"
-    selector_pattern = rf"(?:{identifier}|(?:{identifier})?\.{identifier})"
+    selector_pattern = rf"(?:{identifier}|(?:{identifier})?[.#]{identifier})"
     rules = []
     depth = 0
     prelude = ""
@@ -1489,8 +1489,8 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
                         declarations = _css_declarations("".join(body) + part)
                         if declarations:
                             for selector in selectors:
-                                element, dot, cls = selector.partition(".")
-                                rules.append((element.lower() + dot + cls, declarations))
+                                element, separator, name = selector.partition("#" if "#" in selector else ".")
+                                rules.append((element.lower() + separator + name, declarations))
             if depth == 1 and not nested:
                 body.append(part + delimiter)
     return rules
@@ -1511,25 +1511,32 @@ class _CssStyles:
         self.floats: dict[ET.Element, str] = {}
         self.hidden: set[ET.Element] = set()
         self.font_runs = False
-        # Selector resolution depends only on these three immutable strings,
+        # Selector resolution depends only on these four immutable strings,
         # not on the element's position or its inherited styles. Bound memory
         # for documents containing many distinct class/inline-style values.
-        selector_cache: dict[tuple[str, str, str], dict[str, str]] = {}
+        selector_cache: dict[tuple[str, str, str, str], dict[str, str]] = {}
         inline_cache: dict[str, dict[str, tuple[bool, str]]] = {}
 
         def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
                     parent_hidden: bool = False, parent_display: str = "initial") -> None:
             class_text = elem.get("class", "")
             inline_style = elem.get("style", "")
-            key = (elem.tag, class_text, inline_style)
+            identifier = elem.get("id", "")
+            key = (elem.tag, class_text, inline_style, identifier)
             selected = selector_cache.get(key)
             if selected is None:
                 chosen = {name: (important, 0, order, value)
                           for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
                 for cls in set(class_text.split()):
                     # Specificity within the supported subset: element (0),
-                    # class (1), element.class (2), inline (3).
+                    # class (1), element.class (2), ID (3), element#ID (4), inline (5).
                     for selector, specificity in (("." + cls, 1), (elem.tag + "." + cls, 2)):
+                        for name, (important, order, value) in by_selector.get(selector, {}).items():
+                            candidate = (important, specificity, order, value)
+                            if name not in chosen or candidate[:3] > chosen[name][:3]:
+                                chosen[name] = candidate
+                if identifier:
+                    for selector, specificity in (("#" + identifier, 3), (elem.tag + "#" + identifier, 4)):
                         for name, (important, order, value) in by_selector.get(selector, {}).items():
                             candidate = (important, specificity, order, value)
                             if name not in chosen or candidate[:3] > chosen[name][:3]:
@@ -1541,7 +1548,7 @@ class _CssStyles:
                         if len(inline_cache) < 1024:
                             inline_cache[inline_style] = declarations
                     for name, (important, value) in declarations.items():
-                        candidate = (important, 3, 0, value)
+                        candidate = (important, 5, 0, value)
                         if name not in chosen or candidate[:3] > chosen[name][:3]:
                             chosen[name] = candidate
                 selected = {name: value for name, (_, _, _, value) in chosen.items()}
@@ -2318,7 +2325,7 @@ class _StylesheetLoader:
             if elem.tag not in {"style", "link"}:
                 continue
             if (elem.get("type", "text/css").strip().lower() not in {"", "text/css"}
-                    or elem.get("media", "all").strip().lower() not in {"", "all"}
+                    or elem.get("media", "all").strip().lower() not in {"", "all", "screen"}
                     or "disabled" in elem.attrib):
                 continue
             if elem.tag == "style":
