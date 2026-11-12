@@ -1457,6 +1457,8 @@ def _css_declarations(text: str) -> dict[str, tuple[bool, str]]:
 
 def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
     """Read flat rules, skipping entire at-rule and malformed nested blocks."""
+    identifier = r"(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*"
+    selector_pattern = rf"(?:{identifier}|(?:{identifier})?\.{identifier})"
     rules = []
     depth = 0
     prelude = ""
@@ -1483,10 +1485,12 @@ def _css_rules(text: str) -> list[tuple[str, dict[str, tuple[bool, str]]]]:
                         raise _ResourceLimitError("Too many CSS selectors")
                     selectors = [selector.strip() for selector in prelude.split(",")]
                     # Reject whole unsupported selector lists before parsing declarations.
-                    if all(re.fullmatch(r"\.?(?:[A-Za-z_]|-[A-Za-z_-])[A-Za-z0-9_-]*", s) for s in selectors):
+                    if all(re.fullmatch(selector_pattern, s) for s in selectors):
                         declarations = _css_declarations("".join(body) + part)
                         if declarations:
-                            rules.extend((s if s.startswith(".") else s.lower(), declarations) for s in selectors)
+                            for selector in selectors:
+                                element, dot, cls = selector.partition(".")
+                                rules.append((element.lower() + dot + cls, declarations))
             if depth == 1 and not nested:
                 body.append(part + delimiter)
     return rules
@@ -1523,10 +1527,13 @@ class _CssStyles:
                 chosen = {name: (important, 0, order, value)
                           for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
                 for cls in set(class_text.split()):
-                    for name, (important, order, value) in by_selector.get("." + cls, {}).items():
-                        candidate = (important, 1, order, value)
-                        if name not in chosen or candidate[:3] > chosen[name][:3]:
-                            chosen[name] = candidate
+                    # Specificity within the supported subset: element (0),
+                    # class (1), element.class (2), inline (3).
+                    for selector, specificity in (("." + cls, 1), (elem.tag + "." + cls, 2)):
+                        for name, (important, order, value) in by_selector.get(selector, {}).items():
+                            candidate = (important, specificity, order, value)
+                            if name not in chosen or candidate[:3] > chosen[name][:3]:
+                                chosen[name] = candidate
                 if inline_style:
                     declarations = inline_cache.get(inline_style)
                     if declarations is None:
@@ -1534,7 +1541,7 @@ class _CssStyles:
                         if len(inline_cache) < 1024:
                             inline_cache[inline_style] = declarations
                     for name, (important, value) in declarations.items():
-                        candidate = (important, 2, 0, value)
+                        candidate = (important, 3, 0, value)
                         if name not in chosen or candidate[:3] > chosen[name][:3]:
                             chosen[name] = candidate
                 selected = {name: value for name, (_, _, _, value) in chosen.items()}
