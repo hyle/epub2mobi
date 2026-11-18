@@ -2463,7 +2463,9 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
         anchor = (spine_index.fragments.get((target.path, target.fragment))
                   if target.fragment else spine_index.files.get(target.path))
         item = spine_index.items.get(target.path)
-        destination = (anchor, item) if anchor is not None and item is not None else None
+        destination = None
+        if anchor is not None and item is not None and not _suppressed_element(item.body):
+            destination = (anchor, item)
         destinations.append(destination)
         unresolved += destination is None
         # Recovery coverage retains the old resolver's sibling deduplication
@@ -2943,7 +2945,7 @@ class MinimalHtmlSanitizer:
 
 
 @contextmanager
-def _atomic_output(output_file: Union[str, Path]) -> Iterator[BinaryIO]:
+def _atomic_output(output_file: Union[str, Path], *, protected_input: Optional[Path] = None) -> Iterator[BinaryIO]:
     """Close a complete temporary file before replacing the destination."""
     # Preserve existing symlink targets and keep the temporary file on the
     # destination's filesystem, for both conversion and USB deployment.
@@ -2954,9 +2956,13 @@ def _atomic_output(output_file: Union[str, Path]) -> Iterator[BinaryIO]:
         # than OSError. Translate only failures at this path-resolution boundary.
         raise ConversionError(f"Cannot resolve output path: {output_file}") from e
     try:
-        output_mode = stat.S_IMODE(output_path.stat().st_mode)
+        output_stat = output_path.stat()
     except FileNotFoundError:
         output_mode = None
+    else:
+        if protected_input is not None and os.path.samestat(output_stat, protected_input.stat()):
+            raise ConversionError("Kindle destination resolves to the input EPUB")
+        output_mode = stat.S_IMODE(output_stat.st_mode)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="wb", dir=output_path.parent,
@@ -3682,7 +3688,7 @@ class MobiWriter:
         logger.info("SUCCESS: Created %s", output_file)
 
 
-def deploy_to_kindle(source_file: str) -> None:
+def deploy_to_kindle(source_file: str, *, input_epub: Optional[Path] = None) -> None:
     candidates: list[str] = []
     if sys.platform == "darwin":
         vol = "/Volumes"
@@ -3725,7 +3731,7 @@ def deploy_to_kindle(source_file: str) -> None:
     dest = os.path.join(path, "documents", os.path.basename(source_file))
     # Actual copy failures propagate to main(), which returns a failure
     # status. The completed local conversion remains available for retry.
-    with _atomic_output(dest) as destination:
+    with _atomic_output(dest, protected_input=input_epub) as destination:
         with open(source_file, "rb") as source:
             shutil.copyfileobj(source, destination)
     logger.info("Copied to Kindle: %s", dest)
@@ -3794,7 +3800,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         _log_media_omissions(epub_data.omitted_media, args.report_omissions)
 
         if args.deploy:
-            deploy_to_kindle(str(outfile))
+            deploy_to_kindle(str(outfile), input_epub=infile)
 
         return 0
     except (ConversionError, OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as e:
