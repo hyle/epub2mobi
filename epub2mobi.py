@@ -2903,10 +2903,11 @@ class MinimalHtmlSanitizer:
                 self.has_reading_content = True
             elif attrs.get("alt", "").strip():
                 self._emit_text(attrs["alt"], style)
-            return
-        if output_tag in {"br", "hr", "mbp:pagebreak"}:
+            output_tag = None
+        elif output_tag in {"br", "hr", "mbp:pagebreak"}:
             self.fed.append(f"<{output_tag}/>")
-            return
+            output_tag = None
+        # Continue through text and children to retain indexed fragments in malformed void elements.
         if output_tag:
             attr_str = ""
             if output_tag == "a" and attrs.get("href"):
@@ -3221,6 +3222,9 @@ class MobiWriter:
             for index, filepos in enumerate(positions_in_text_order)
         }
         entry_ends = [end_by_position[filepos] for filepos in entry_positions]
+        # Equal-width names keep INDX keys lexicographically sorted.
+        last_index = len(self.epub.toc_entries) - 1
+        name_width = max(3, len(str(last_index)))
         # A parent spans its descendants too. Flat entries still use the next
         # physical destination as their boundary, including out-of-order TOCs.
         for index in range(len(parents) - 1, -1, -1):
@@ -3231,7 +3235,7 @@ class MobiWriter:
             zip(self.epub.toc_entries, entry_positions, label_offsets)
         ):
             entry_offsets.append(INDX_HEADER_LEN + len(entries_blob))
-            name = f"{index:03d}".encode("ascii")
+            name = f"{index:0{name_width}d}".encode("ascii")
             length = max(1, entry_ends[index] - filepos)
 
             entries_blob.append(len(name))
@@ -3268,7 +3272,7 @@ class MobiWriter:
             raise _NavigationSizeError("INDX navigation record exceeds single-record limit")
 
         tagx = self._build_tagx(nested=any(depths))
-        last_name = f"{len(self.epub.toc_entries) - 1:03d}".encode("ascii")
+        last_name = f"{last_index:0{name_width}d}".encode("ascii")
         main_dummy = bytes((len(last_name),)) + last_name
         main_dummy += struct.pack(">H", len(self.epub.toc_entries))
         main_dummy += b"\x00" * (-(INDX_HEADER_LEN + len(tagx) + len(main_dummy)) % 4)
