@@ -397,6 +397,10 @@ class _ResourceLimitError(ConversionError):
     """A processing budget is exhausted; optional resources cannot bypass it."""
 
 
+class _ZipChecksumError(zipfile.BadZipFile):
+    """A ZIP member was read to completion but failed its CRC check."""
+
+
 def _toc_parent_indices(depths: tuple[int, ...]) -> list[Optional[int]]:
     """Validate preorder depths and locate each entry's nearest ancestor."""
     parents: list[Optional[int]] = []
@@ -1315,7 +1319,14 @@ def _read_zip_member(
                     raise ConversionError("This Python ZIP reader cannot safely bound DEFLATE output")
                 inflator = _BoundedZipInflator(decoder, info.file_size, member_path)
                 member._decompressor = inflator
-            data = member.read(size_limit + 1)
+            try:
+                data = member.read(size_limit + 1)
+            except zipfile.BadZipFile as e:
+                # zipfile uses BadZipFile for CRC mismatches and structural failures.
+                if (str(e) == f"Bad CRC-32 for file {member.name!r}"
+                        and (inflator is None or inflator.eof)):
+                    raise _ZipChecksumError(str(e)) from e
+                raise
             if inflator is not None and not inflator.eof:
                 raise zipfile.BadZipFile(f"Truncated DEFLATE stream: {member_path}")
     except read_errors as e:
@@ -1516,12 +1527,14 @@ class _CssStyles:
         # for documents containing many distinct class/inline-style values.
         selector_cache: dict[tuple[str, str, str, str], dict[str, str]] = {}
         inline_cache: dict[str, dict[str, tuple[bool, str]]] = {}
+        # Unique IDs would defeat cache reuse when no selector depends on them.
+        has_id_selectors = any("#" in selector for selector in by_selector)
 
         def resolve(elem: ET.Element, parent: dict[str, str], parent_float: str = "none",
                     parent_hidden: bool = False, parent_display: str = "initial") -> None:
             class_text = elem.get("class", "")
             inline_style = elem.get("style", "")
-            identifier = elem.get("id", "")
+            identifier = elem.get("id", "") if has_id_selectors else ""
             key = (elem.tag, class_text, inline_style, identifier)
             selected = selector_cache.get(key)
             if selected is None:
@@ -2200,6 +2213,7 @@ class _ImageLoader:
         self.package = package
         self.resources = resources
         self.by_path: dict[str, int] = {}
+        self.checksum_failures: dict[str, str] = {}
         self.records: list[bytes] = []
         self.cover_index: Optional[int] = None
 
@@ -2213,6 +2227,9 @@ class _ImageLoader:
         if not _is_supported_image_media_type(media_type):
             self.resources.omit(target_path, source, f"unsupported image format: {media_type or 'unspecified'}")
             return None
+        if target_path in self.checksum_failures:
+            self.resources.omit(target_path, source, self.checksum_failures[target_path])
+            return None
         recindex = self.by_path.get(target_path)
         if recindex is not None:
             image_data = self.records[recindex - 1]
@@ -2221,6 +2238,11 @@ class _ImageLoader:
                 image_data = self.resources.read(target_path, size_limit=MAX_IMAGE_BYTES, kind="Image resource")
             except KeyError:
                 self.resources.omit(target_path, source, "image file is missing from the EPUB")
+                return None
+            except _ZipChecksumError as e:
+                reason = f"image could not be read: {e}"
+                self.checksum_failures[target_path] = reason
+                self.resources.omit(target_path, source, reason)
                 return None
         if not image_data:
             self.resources.omit(target_path, source, "image file is empty")
@@ -2356,6 +2378,8 @@ class _StylesheetLoader:
                     data = self.resources.read(path, size_limit=MAX_CSS_BYTES, kind="CSS file")
                 except KeyError:
                     self.errors[path] = "stylesheet is missing"
+                except _ZipChecksumError as e:
+                    self.errors[path] = f"stylesheet could not be read: {e}"
                 else:
                     reserve(len(data))
                     self.cache[path] = (len(data), [])
