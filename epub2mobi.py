@@ -362,6 +362,13 @@ class _SpineIndex:
     fragments: Mapping[tuple[str, str], str]
     items: dict[str, SpineItem]
 
+    def resolve_destination(self, path: str, fragment: Optional[str]) -> Optional[tuple[str, SpineItem]]:
+        item = self.items.get(path)
+        if item is None or _suppressed_element(item.body):
+            return None
+        anchor = self.fragments.get((path, fragment)) if fragment else self.files.get(path)
+        return (anchor, item) if anchor is not None else None
+
 
 @dataclass(frozen=True)
 class TextLayout:
@@ -997,16 +1004,18 @@ def _extract_nav_targets(
         return [], False, reading_starts
 
     toc_targets: list[TocTarget] = []
-    invalid_destinations = False
+    incomplete = False
     navigation_entries = 0
 
     def add_target(elem: ET.Element, parent: Optional[int]) -> Optional[int]:
-        nonlocal invalid_destinations, navigation_entries
+        nonlocal incomplete, navigation_entries
         navigation_entries += 1
         if navigation_entries > MAX_BOOK_ENTRIES:
             raise _ResourceLimitError(f"Too many navigation entries: {nav_path}")
         label = _navigation_label(elem)
         if not label:
+            if elem.tag == "a":
+                incomplete = True
             return parent
         if elem.tag == "span":
             index = len(toc_targets)
@@ -1014,22 +1023,29 @@ def _extract_nav_targets(
             return index
         raw_href = elem.attrib.get("href")
         if not raw_href:
+            incomplete = True
             return parent
         try:
             resolved = _resolve_book_href(nav_path, raw_href, nav_base_url)
         except ConversionError as e:
             logger.warning("EPUB3 nav TOC: skipped invalid destination %s: %s", raw_href, e)
-            invalid_destinations = True
+            incomplete = True
             return parent
         if resolved is None:
-            invalid_destinations = True
+            incomplete = True
             return parent
         target_path, fragment = resolved
         index = len(toc_targets)
         toc_targets.append(TocTarget(path=target_path, fragment=fragment, label=label, parent=parent))
         return index
 
-    stack = [(toc_nav, None)]
+    # A structured TOC takes its entries from the lists, excluding any title
+    # or other content alongside them. Retain support for older listless TOCs.
+    entry_roots = [child for child in toc_nav if child.tag in {"ol", "ul"}]
+    if not entry_roots:
+        headings = {"h1", "h2", "h3", "h4", "h5", "h6", "hgroup"}
+        entry_roots = [child for child in toc_nav if child.tag not in headings]
+    stack = [(child, None) for child in reversed(entry_roots)]
     while stack:
         elem, parent = stack.pop()
         if _suppressed_element(elem):
@@ -1041,7 +1057,7 @@ def _extract_nav_targets(
         heading = next((child for child in elem if child.tag in {"a", "span"}), None) if elem.tag == "li" else None
         child_parent = add_target(heading, parent) if heading is not None else parent
         stack.extend((child, child_parent) for child in reversed(list(elem)) if child is not heading)
-    return toc_targets, invalid_destinations, reading_starts
+    return toc_targets, incomplete, reading_starts
 
 
 def _extract_ncx_toc_targets(
@@ -2495,12 +2511,7 @@ def _resolve_toc_targets(targets: list[TocTarget], source: str, spine_index: _Sp
         if target.path is None:
             destinations.append(None)
             continue
-        anchor = (spine_index.fragments.get((target.path, target.fragment))
-                  if target.fragment else spine_index.files.get(target.path))
-        item = spine_index.items.get(target.path)
-        destination = None
-        if anchor is not None and item is not None and not _suppressed_element(item.body):
-            destination = (anchor, item)
+        destination = spine_index.resolve_destination(target.path, target.fragment)
         destinations.append(destination)
         unresolved += destination is None
         # Recovery coverage retains the old resolver's sibling deduplication
@@ -2545,12 +2556,11 @@ def _resolve_reading_start(targets: list[ReadingStart], index: _SpineIndex) -> O
     anchors: set[str] = set()
     unresolved = 0
     for target in targets:
-        item = index.items.get(target.path)
-        anchor = (index.fragments.get((target.path, target.fragment)) if target.fragment
-                  else index.files.get(target.path))
-        if anchor is None or item is None or _suppressed_element(item.body):
+        destination = index.resolve_destination(target.path, target.fragment)
+        if destination is None:
             unresolved += 1
         else:
+            anchor, _ = destination
             anchors.add(anchor)
     if unresolved:
         logger.warning("%s reading start: ignored %d unresolved destination(s)", targets[0].source, unresolved)
@@ -3081,7 +3091,8 @@ class MobiWriter:
         )
 
     @staticmethod
-    def _prepare_internal_links(body_bytes: bytes, positions: dict[bytes, int]) -> tuple[bytes, list[bytes]]:
+    def _prepare_internal_links(body_bytes: bytes, positions: dict[bytes, int],
+                                placeholder: bytes) -> tuple[bytes, list[bytes]]:
         targets: list[bytes] = []
 
         def replace(match: re.Match[bytes]) -> bytes:
@@ -3089,13 +3100,13 @@ class MobiWriter:
             if anchor not in positions:
                 return match.group(1)
             targets.append(anchor)
-            return match.group(1) + b' filepos="??????????"'
+            return match.group(1) + placeholder
 
         return re.sub(rb'(<a\b[^>]*?) href="#([^"]+)"', replace, body_bytes), targets
 
     @staticmethod
     def _finish_internal_links(body_bytes: bytes, body_start: int, targets: list[bytes],
-                               positions: dict[bytes, int]) -> bytes:
+                               positions: dict[bytes, int], placeholder: bytes) -> bytes:
         target_iter = iter(targets)
 
         def replace(match: re.Match[bytes]) -> bytes:
@@ -3104,7 +3115,7 @@ class MobiWriter:
                 raise ValueError(f"Internal link filepos out of range: {filepos}")
             return match.group(1) + f' filepos="{filepos:0{TOC_FILEPOS_WIDTH}d}"'.encode("ascii")
 
-        return re.sub(rb'(<a\b[^>]*?) filepos="\?{10}"', replace, body_bytes)
+        return re.sub(rb'(<a\b[^>]*?)' + re.escape(placeholder), replace, body_bytes)
 
     def _build_text_layout(self) -> TextLayout:
         # The MOBI header declares the encoding. An HTML charset declaration
@@ -3115,7 +3126,10 @@ class MobiWriter:
         body_bytes = _encode_mobi_text(self.epub.html_content)
         if len(body_bytes) > MAX_OUTPUT_HTML_BYTES:
             raise _ResourceLimitError("Generated HTML too large")
-        body_bytes, internal_targets = self._prepare_internal_links(body_bytes, self._anchor_positions(body_bytes))
+        placeholder = b' filepos="' + b"?" * TOC_FILEPOS_WIDTH + b'"'
+        body_bytes, internal_targets = self._prepare_internal_links(
+            body_bytes, self._anchor_positions(body_bytes), placeholder
+        )
         # Replacements change byte offsets. Scan once more, then share these
         # positions between TOC construction and final fixed-width link values.
         positions = self._anchor_positions(body_bytes)
@@ -3141,7 +3155,7 @@ class MobiWriter:
 
         if body_start + len(body_bytes) + len(toc_separator) + len(toc_bytes) + len(b"</body></html>") > MAX_OUTPUT_HTML_BYTES:
             raise _ResourceLimitError("Generated HTML too large")
-        body_bytes = self._finish_internal_links(body_bytes, body_start, internal_targets, positions)
+        body_bytes = self._finish_internal_links(body_bytes, body_start, internal_targets, positions, placeholder)
         reading_start_offset = None
         if self.epub.reading_start_anchor is not None:
             position = positions.get(_encode_mobi_text(self.epub.reading_start_anchor))
