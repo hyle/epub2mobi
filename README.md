@@ -1,40 +1,46 @@
 # epub2mobi.py
 
-`epub2mobi.py` converts EPUB books to legacy MOBI6 for Kindle devices. It is a single Python script with no external dependencies and no internet connection required.
+`epub2mobi.py` converts EPUB books to MOBI for older Kindle devices. It is a single Python script with no external dependencies and no internet connection required.
 
 Download the script, run it, and bring your books to your Kindle.
 
-## Install and use
+## Download and use
 
 Requires **Python 3.9+**. No Python packages or external converters to install.
 
-Download the script:
+Download the script.
 
 ```bash
 curl -fL https://raw.githubusercontent.com/hyle/epub2mobi/main/epub2mobi.py -o epub2mobi.py
 ```
 
-Convert an EPUB to a `.mobi` beside the input file:
+### Basic usage
+
+Run the script with the path to your EPUB.
 
 ```bash
 python3 epub2mobi.py my_book.epub
 ```
 
-Choose an output path:
+This creates `my_book.mobi` next to `my_book.epub`. To transfer it manually, connect your Kindle over USB and copy the MOBI to its `documents` folder.
+
+### Advanced usage
+
+**Choose an output path** with `-o` or `--output`.
 
 ```bash
 python3 epub2mobi.py my_book.epub -o converted.mobi
 ```
 
-Copy the result to a connected Kindle over USB:
+**Copy the MOBI to a connected Kindle over USB** with `--deploy`.
 
 ```bash
 python3 epub2mobi.py my_book.epub --deploy
 ```
 
-Automatic deployment copies only when exactly one Kindle matches. Multiple matches produce an error before copying; the local MOBI remains available for manual transfer. Duplicate paths and symlink aliases count as one match.
+Automatic deployment copies only when exactly one Kindle matches. If no Kindle matches, conversion succeeds with a warning. Multiple matches produce an error before copying, and the local MOBI remains available for manual transfer. Duplicate paths and symlink aliases count as one match.
 
-List omitted resources and the reasons:
+**See which resources were omitted and why** with `--report-omissions`.
 
 ```bash
 python3 epub2mobi.py my_book.epub --report-omissions
@@ -42,9 +48,9 @@ python3 epub2mobi.py my_book.epub --report-omissions
 
 Options can be combined. Use `--help` for the CLI reference.
 
-## Why MOBI6?
+## Why MOBI?
 
-MOBI6 provides the essentials for reflowable books: text, chapter navigation, linked notes, basic formatting, and images. Advanced typography, embedded fonts, and fixed layouts are outside the converter's scope; the emphasis is on preserving readable content and navigation.
+MOBI provides the essentials for reflowable books: text, chapter navigation, linked notes, basic formatting, and images. Advanced typography, embedded fonts, and fixed layouts are outside the converter's scope; the emphasis is on preserving readable content and navigation.
 
 ## What it preserves
 
@@ -56,7 +62,7 @@ MOBI6 provides the essentials for reflowable books: text, chapter navigation, li
 - Referenced local JPEG, PNG, and GIF images, plus declared raster covers.
 - Title, author credits, and language metadata.
 
-Output uses PalmDOC compression and targets **MOBI6**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
+Output uses PalmDOC compression and targets **MOBI**. Advanced CSS, fixed layout, JavaScript, embedded fonts, SVG, audio, video, and AZW3/KF8 output are unsupported. Remote resources are never downloaded.
 
 PalmDOC compression uses a heuristic match search to favor conversion speed. Compared with exhaustive matching, it can produce larger MOBI files and different compressed bytes while preserving the generated HTML after decompression. Conversion time and file size depend on the book's content.
 
