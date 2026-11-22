@@ -104,6 +104,7 @@ MAX_OUTPUT_HTML_BYTES = 64 * 1024 * 1024  # Encoded MOBI HTML, including the foo
 
 # Optimization threshold only: longer CSS declaration lists still use the tokenizer.
 _CSS_SPLIT_MAX_CHARS = 4096
+_HTML_CLASS_TOKEN_RE = re.compile(r"[^ \t\n\f\r]+")
 
 # EXTH Types
 EXTH_AUTHOR = 100
@@ -643,14 +644,16 @@ def _find_opf(resources: _ResourceReader) -> tuple[str, str]:
 
     opf_path = None
     # Prefer OCF declarations; tolerate missing namespaces in imperfect EPUBs.
-    for tag in (CONTAINER_NAMESPACE + "rootfile", "rootfile"):
-        for elem in root.iter(tag):
-            candidate = elem.attrib.get("full-path")
-            if candidate:
-                opf_path = candidate
+    rootfiles = _find_xml_child(root, "rootfiles", CONTAINER_NAMESPACE)
+    if rootfiles is not None:
+        for tag in (CONTAINER_NAMESPACE + "rootfile", "rootfile"):
+            for elem in rootfiles.iterfind(tag):
+                candidate = elem.attrib.get("full-path")
+                if candidate:
+                    opf_path = candidate
+                    break
+            if opf_path:
                 break
-        if opf_path:
-            break
     if not opf_path:
         raise ConversionError("Invalid EPUB container: no rootfile in META-INF/container.xml")
 
@@ -668,6 +671,12 @@ def _parse_xhtml(data: bytes, source_name: str) -> ET.Element:
         elem = stack.pop()
         if elem.tag.startswith("{http://www.w3.org/1999/xhtml}"):
             elem.tag = _strip_ns(elem.tag)
+        if elem.tag == "template":
+            # Inactive contents must stay out of metadata and stylesheet scans.
+            tail = elem.tail
+            elem.clear()
+            elem.tail = tail
+            continue
         stack.extend(elem)
     return root
 
@@ -682,7 +691,7 @@ def _body_element(root: ET.Element) -> ET.Element:
 
 
 def _suppressed_element(elem: ET.Element) -> bool:
-    return _strip_ns(elem.tag) in {"script", "style", "head", "svg"}
+    return elem.tag == "template" or _strip_ns(elem.tag) in {"script", "style", "head", "svg"}
 
 
 def _visible_elements(root: ET.Element):
@@ -1013,6 +1022,7 @@ def _extract_nav_targets(
             invalid_destinations = True
             return parent
         if resolved is None:
+            invalid_destinations = True
             return parent
         target_path, fragment = resolved
         index = len(toc_targets)
@@ -1541,7 +1551,7 @@ class _CssStyles:
             if selected is None:
                 chosen = {name: (important, 0, order, value)
                           for name, (important, order, value) in by_selector.get(elem.tag, {}).items()}
-                for cls in set(class_text.split()):
+                for cls in set(_HTML_CLASS_TOKEN_RE.findall(class_text)):
                     # Specificity within the supported subset: element (0),
                     # class (1), element.class (2), ID (3), element#ID (4), inline (5).
                     for selector, specificity in (("." + cls, 1), (elem.tag + "." + cls, 2)):
@@ -2989,7 +2999,7 @@ def _atomic_output(output_file: Union[str, Path], *, protected_input: Optional[P
         if not stat.S_ISREG(output_stat.st_mode):
             raise ConversionError(f"Output destination {output_path} is not a regular file")
         if protected_input is not None and os.path.samestat(output_stat, protected_input.stat()):
-            raise ConversionError("Kindle destination resolves to the input EPUB")
+            raise ConversionError("Output destination resolves to the input EPUB")
         output_mode = stat.S_IMODE(output_stat.st_mode)
     temporary_path = None
     try:
@@ -3656,7 +3666,7 @@ class MobiWriter:
 
         return bytes(pdb), bytes(rec_info)
 
-    def build(self, output_file: str) -> None:
+    def build(self, output_file: str, *, protected_input: Optional[Path] = None) -> None:
         for field_name, value in (("Title", self.epub.title), ("Author", self.epub.author)):
             try:
                 value.encode(MOBI_TEXT_ENCODING_PY)
@@ -3709,7 +3719,7 @@ class MobiWriter:
 
         pdb_header, rec_info = self._build_pdb_header_and_index(records)
 
-        with _atomic_output(output_file) as f:
+        with _atomic_output(output_file, protected_input=protected_input) as f:
             f.write(pdb_header)
             f.write(rec_info)
             f.write(b"\x00\x00")
@@ -3827,7 +3837,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if outfile.exists() and infile.samefile(outfile):
             raise ConversionError("Output path resolves to the input EPUB; choose a different output path")
         epub_data = parse_epub(infile)
-        MobiWriter(epub_data).build(str(outfile))
+        MobiWriter(epub_data).build(str(outfile), protected_input=infile)
         _log_media_omissions(epub_data.omitted_media, args.report_omissions)
 
         if args.deploy:
