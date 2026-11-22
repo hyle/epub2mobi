@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EPUB2 -> MOBI6 generator (Legacy Kindle Target)
+EPUB2 -> MOBI generator (Legacy Kindle Target)
 """
 
 from __future__ import annotations
@@ -699,8 +699,9 @@ def _visible_text(root: ET.Element, block_separators: bool = False) -> str:
     text = (root.text or "") + "".join(
         _visible_text(child, block_separators) + (child.tail or "") for child in root
     )
-    blocks = _HTML_BLOCKS | _HTML_FLATTENED_BLOCKS
-    return f" {text} " if block_separators and root.tag in blocks else text
+    if root.tag == "br" or (block_separators and root.tag in (_HTML_BLOCKS | _HTML_FLATTENED_BLOCKS)):
+        return f" {text} "
+    return text
 
 
 def _fragment_ids(root: ET.Element) -> tuple[str, ...]:
@@ -2985,6 +2986,8 @@ def _atomic_output(output_file: Union[str, Path], *, protected_input: Optional[P
     except FileNotFoundError:
         output_mode = None
     else:
+        if not stat.S_ISREG(output_stat.st_mode):
+            raise ConversionError(f"Output destination {output_path} is not a regular file")
         if protected_input is not None and os.path.samestat(output_stat, protected_input.stat()):
             raise ConversionError("Kindle destination resolves to the input EPUB")
         output_mode = stat.S_IMODE(output_stat.st_mode)
@@ -3766,7 +3769,7 @@ def deploy_to_kindle(source_file: str, *, input_epub: Optional[Path] = None) -> 
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Convert EPUB files to legacy MOBI6.")
+    parser = argparse.ArgumentParser(description="Convert EPUB files to legacy MOBI.")
     parser.add_argument("input_epub", help="Path to the input EPUB file")
     parser.add_argument(
         "-o",
