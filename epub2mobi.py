@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EPUB2 -> MOBI generator (Legacy Kindle Target)
+EPUB -> MOBI converter (Legacy Kindle Target)
 """
 
 from __future__ import annotations
